@@ -76,3 +76,9 @@ xianyusaas迭代演示UI-1.html
 # Windows handoff business assets are imported locally, not baked into the image.
 /deployment-assets/
 /MANIFEST.sha256
+
+**/customer-faq-updates.json
+**/faq-sync.json
+**/faq-sync-input.json
+**/faq-sync-status.json
+**/faq-backup-*.json

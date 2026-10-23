@@ -90,3 +90,9 @@ node_modules/
 
 /docs/assets/
 /docs/UPSTREAM-README.md
+
+**/customer-faq-updates.json
+**/faq-sync.json
+**/faq-sync-input.json
+**/faq-sync-status.json
+**/faq-backup-*.json
