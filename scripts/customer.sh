@@ -20,7 +20,11 @@ if [[ -f .local/compose.local.yml ]]; then
   compose_files+=(-f .local/compose.local.yml)
 fi
 case "${1:-start}" in
-  start) "${compose[@]}" --env-file config/customer.env "${compose_files[@]}" up -d --build ;;
+  start)
+    python3 scripts/sync-local-faqs.py --validate
+    "${compose[@]}" --env-file config/customer.env "${compose_files[@]}" up -d --build
+    python3 scripts/sync-local-faqs.py
+    ;;
   stop) "${compose[@]}" --env-file config/customer.env "${compose_files[@]}" stop ;;
   status) "${compose[@]}" --env-file config/customer.env "${compose_files[@]}" ps ;;
   logs) "${compose[@]}" --env-file config/customer.env "${compose_files[@]}" logs --tail=100 customer ;;

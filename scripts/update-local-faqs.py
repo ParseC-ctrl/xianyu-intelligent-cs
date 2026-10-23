@@ -31,6 +31,12 @@ def merge_faqs(current, updates):
     return result
 
 
+def canonical_faqs(rows):
+    return [{**row, 'question':row['question'].strip(), 'answer':row['answer'].strip(),
+             'topics':sorted(set(x.strip() for x in row.get('topics',[]))),
+             'enabled':row.get('enabled',False), 'fixed_reply':row.get('fixed_reply',False)} for row in rows]
+
+
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -71,7 +77,7 @@ def main():
                 {'id':row['id'], 'enabled':row.get('enabled') is True,
                  'fixed_reply':row.get('fixed_reply') is True,
                  'question_is_exact_alias':args.question == row.get('question') or args.question in row.get('topics', []),
-                 'matches_local_update':all(row.get(k) == expected[row['id']].get(k) for k in ('answer','enabled','fixed_reply')) if row['id'] in expected else None}
+                 'matches_local_update':canonical_faqs([row]) == canonical_faqs([expected[row['id']]]) if row['id'] in expected else None}
                 for row in before], 'expected_faq_ids_missing':sorted(set(expected)-{row['id'] for row in before})}
             conversations = request('/api/bot/conversations?limit=1')
             report['conversations_pending_owner'] = conversations.get('needs_human_total')
@@ -83,18 +89,19 @@ def main():
             print(json.dumps(report,ensure_ascii=False,indent=2))
             return
         merged = merge_faqs(before, updates)
+        if canonical_faqs(before) == canonical_faqs(merged):
+            print('Local FAQ configuration already matches; no write or backup needed')
+            return
         private = root/'.local'; private.mkdir(mode=0o700, exist_ok=True)
         backup = private/('faq-backup-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')+'.json')
         fd = os.open(backup, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as stream:
             json.dump({'faqs':before},stream,ensure_ascii=False)
-        if request('/api/bot/materials/faqs')['faqs'] != before:
-            raise RuntimeError('FAQ changed concurrently; no update sent')
-        request('/api/bot/materials/faqs', 'PUT', {'faqs':merged})
+        request('/api/bot/materials/faqs/merge', 'POST', {'faqs':updates})
         saved = request('/api/bot/materials/faqs')['faqs']
         actual = {row['id']:row for row in saved}
         for row in updates:
-            if any(actual.get(row['id'],{}).get(key, False if key == 'fixed_reply' else None) != row[key] for key in ('answer','enabled','fixed_reply') if key in row):
+            if row['id'] not in actual or canonical_faqs([actual[row['id']]]) != canonical_faqs([row]):
                 raise RuntimeError('FAQ verification failed; preserve backup and inspect locally')
         print('Local FAQ updates verified:',len(updates))
         print('Previous FAQ backup:',backup)

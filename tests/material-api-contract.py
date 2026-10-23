@@ -220,6 +220,18 @@ def main():
         unsafe = client.put("/api/bot/materials/faqs", json={"faqs": [{**faq, "answer": "API_KEY=fixture-unsafe-value"}]}, headers=headers)
         assert unsafe.status_code == 400
         assert client.get("/api/bot/materials/faqs").json()["faqs"][0]["answer"] == faq["answer"]
+        merged_faq = {"id": "deploy-fixture", "question": "合成部署问题", "answer": "合成部署回答", "topics": [], "enabled": True, "fixed_reply": True}
+        merged_response = client.post("/api/bot/materials/faqs/merge", json={"faqs": [merged_faq]}, headers=headers)
+        assert merged_response.status_code == 200, merged_response.text
+        assert {row["id"] for row in merged_response.json()["faqs"]} == {"invoice", "deploy-fixture"}
+        again = client.post("/api/bot/materials/faqs/merge", json={"faqs": [merged_faq]}, headers=headers)
+        assert again.json()["knowledge_version"] == merged_response.json()["knowledge_version"]
+        foreign = client.post("/api/bot/materials/faqs/merge", json={"faqs": [merged_faq]}, headers={**headers, "X-Shop-Account": "someone-else"})
+        assert foreign.status_code in {403, 404}
+        invalid = client.post("/api/bot/materials/faqs/merge", json={"faqs": [merged_faq, merged_faq]}, headers=headers)
+        assert invalid.status_code == 400
+        assert len(client.get("/api/bot/materials/faqs").json()["faqs"]) == 2
+        client.put("/api/bot/materials/faqs", json={"faqs": [{**faq, "enabled": True}]}, headers=headers)
         assert client.get("/api/bot/materials/status", headers={"X-Shop-Account": "someone-else"}).status_code in {403, 404}
         account = app.db.get_shop_account(1, account_key="default")
         path = Path(app.ai_service.runtime_paths(1, account["id"], "default")["products_snapshot_file"])

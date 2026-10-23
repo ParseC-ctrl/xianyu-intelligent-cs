@@ -285,3 +285,26 @@ bash scripts/customer.sh status
 Windows Agent 应先记录旧运行目录、提交、Compose 项目名、数据卷、配置和已有备份；在 WSL 的另一个 Linux 路径克隆公开仓库，检查 `AGENTS.md` 与部署文档。使用当前已有的 Compose 项目和命名卷，安全复制原 `config/customer.env` 及管理员凭据到新运行副本，仅在本地保留。自定义 override 需要核对其相对路径与机器网络。不得复制旧 `.git`、上传真实知识库、重新初始化主密钥或启动第二个独立项目。
 
 确认新配置指向同一数据卷、端口和 Compose 项目后，在维护时段从新运行目录重新构建并替换原容器。原目录和备份先保留；验证登录、知识库和账号状态后，以新运行副本作为后续更新目录。远程公开行为不会修改 Windows 已运行的容器或数据。
+
+## 11. 部署时自动同步私有 FAQ（配置一次）
+
+代码更新来自公开 Git；真实 FAQ 更新来自用户本地或 Windows 共享目录，两者分别管理。首次在实际 WSL 运行目录执行一次：
+
+```bash
+python3 scripts/sync-local-faqs.py --configure --source '/实际共享路径/deployment-assets/customer-faq-updates.json' --account default
+```
+
+源文件应指向 Mac 和 Windows 共同可见、后续持续维护的那份文件，而不是一次性复制到 WSL 的过期副本。使用 `wslpath` 确定 Windows 路径在 WSL 中的实际位置。默认复用 `.local/windows-admin.json`，其他凭据位置用 `--credentials`；端口默认读取本机 `config/customer.env`，也可显式传 `--origin http://127.0.0.1:实际端口`。不创建或重置管理员。多账号仅同步 `--account` 指定的账号。
+
+配置存在 `.local/faq-sync.json`，始终被 Git 忽略。之后每次在同一 WSL 运行目录更新：
+
+```bash
+git pull --ff-only origin main
+bash scripts/customer.sh start
+```
+
+启动脚本先检查共享文件、格式和凭据文件是否可用，再构建和启动容器，等待本地 API 就绪，自动按 FAQ ID 原子合并。文件列出的同 ID 条目以私有源文件为准，其余已有 FAQ 保留；从源文件删除条目不会删除库中条目。相同配置不重复写入或产生备份。发生变更时先备份旧 FAQ 到 `.local/faq-backup-*.json`，结果写入 `.local/faq-sync-status.json`，均不含于公开仓库。不要同时修改同一个受源文件管理的 FAQ；页面修改可能在下一次部署时被源文件覆盖。
+
+没有配置过自动同步时保持旧行为并明确提示跳过。已经配置后，如果共享盘未挂载、文件损坏或凭据文件缺失，预检失败会阻止本次重建；服务启动后发生登录、API 或合并失败则命令返回失败，既有数据保留，不能报告部署全部完成。排障时查看本地错误和备份，不删库、不换密钥。不自动恢复接管会话，不调用模型、不请求闲鱼、不刷新商品，也不自动同步 Excel 或替换知识库。
+
+换运行目录时须安全迁移本机 `.local/faq-sync.json` 及管理员凭据，并核对绝对路径；不要将机器配置、输入快照、备份、真实知识库或政策文件加入 Git、Release 或 Actions 附件。

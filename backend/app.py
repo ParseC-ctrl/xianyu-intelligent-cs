@@ -321,6 +321,7 @@ def _customer_api_allowed(path: str, method: str) -> bool:
         "/api/bot/materials/status": {"GET"}, "/api/bot/materials/search": {"GET"},
         "/api/bot/materials/import": {"POST"}, "/api/bot/materials/preview": {"POST"},
         "/api/bot/materials/faqs": {"GET", "PUT"},
+        "/api/bot/materials/faqs/merge": {"POST"},
         "/api/bot/reply-settings": {"GET", "PUT"},
         "/api/bot/catalog": {"GET"}, "/api/bot/catalog/sync": {"POST"},
         "/api/bot/catalog/settings": {"GET", "PUT"},
@@ -5244,6 +5245,16 @@ def save_material_faqs(body: MaterialFaqsIn, user=Depends(Auth.current_user), ac
     try:
         store = ai_service.material_store(*_ai_scope(user, account))
         return {"faqs": store.save_faqs(body.faqs), "knowledge_version": store.reply_version()}
+    except MaterialKnowledgeError as error:
+        _material_error(error)
+
+
+@app.post("/api/bot/materials/faqs/merge")
+def merge_material_faqs(body: MaterialFaqsIn, user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+    _require_permission(user, "automation.ai")
+    try:
+        store = ai_service.material_store(*_ai_scope(user, account))
+        return {"faqs": store.merge_faqs(body.faqs), "knowledge_version": store.reply_version()}
     except MaterialKnowledgeError as error:
         _material_error(error)
 

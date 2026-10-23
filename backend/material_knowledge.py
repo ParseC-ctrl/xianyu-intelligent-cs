@@ -344,6 +344,20 @@ class MaterialKnowledgeStore:
             row = conn.execute("SELECT payload FROM faqs WHERE id=1").fetchone()
         return self._normalize_faqs(json.loads(row[0])) if row else []
 
+    def merge_faqs(self, updates: list) -> list[dict]:
+        updates = self._normalize_faqs(updates)
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT payload FROM faqs WHERE id=1").fetchone()
+            current = self._normalize_faqs(json.loads(row[0])) if row else []
+            pending = {faq["id"]: faq for faq in updates}
+            merged = [pending.pop(faq["id"], faq) for faq in current]
+            merged.extend(pending.values())
+            merged = self._normalize_faqs(merged)
+            if merged != current:
+                conn.execute("INSERT OR REPLACE INTO faqs VALUES (1,?)", (json.dumps(merged, ensure_ascii=False),))
+        return merged
+
     def save_faqs(self, faqs: list) -> list[dict]:
         normalized = self._normalize_faqs(faqs)
         with self._connection() as conn:
