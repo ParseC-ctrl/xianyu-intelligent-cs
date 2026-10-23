@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import urllib.parse
+import urllib.error
 import urllib.request
 
 
@@ -33,13 +34,20 @@ def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--origin', default='http://127.0.0.1:4173')
-    parser.add_argument('--file', type=Path, required=True)
+    parser.add_argument('--file', type=Path)
+    parser.add_argument('--check', action='store_true', help='Read-only local FAQ/preview diagnosis; never sends buyer messages')
+    parser.add_argument('--question', default='')
+    parser.add_argument('--model', action='store_true', help='Opt-in model preview in check mode; may consume model tokens')
     parser.add_argument('--credentials', type=Path, default=root/'.local/windows-admin.json')
     args = parser.parse_args()
     parsed = urllib.parse.urlsplit(args.origin)
     if parsed.scheme != 'http' or parsed.hostname not in {'127.0.0.1', 'localhost'} or parsed.username or parsed.password or parsed.path not in {'', '/'} or parsed.query or parsed.fragment:
         parser.error('origin must be a local loopback HTTP origin')
-    updates = json.loads(args.file.read_text(encoding='utf-8'))['faqs']
+    if not args.check and args.file is None:
+        parser.error('--file is required for updates')
+    if args.model and not args.check:
+        parser.error('--model requires --check')
+    updates = json.loads(args.file.read_text(encoding='utf-8'))['faqs'] if args.file else []
     auth = json.loads(args.credentials.read_text(encoding='utf-8'))
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()), NoRedirect())
     def request(path, method='GET', payload=None):
@@ -53,6 +61,23 @@ def main():
         request('/api/auth/login', 'POST', auth)
         logged_in = True
         before = request('/api/bot/materials/faqs')['faqs']
+        if args.check:
+            expected = {row['id']:row for row in updates}
+            report = {'service':request('/api/version/public'), 'faq_status':[
+                {'id':row['id'], 'enabled':row.get('enabled') is True,
+                 'fixed_reply':row.get('fixed_reply') is True,
+                 'question_is_exact_alias':args.question == row.get('question') or args.question in row.get('topics', []),
+                 'matches_local_update':all(row.get(k) == expected[row['id']].get(k) for k in ('answer','enabled','fixed_reply')) if row['id'] in expected else None}
+                for row in before], 'expected_faq_ids_missing':sorted(set(expected)-{row['id'] for row in before})}
+            conversations = request('/api/bot/conversations?limit=1')
+            report['conversations_pending_owner'] = conversations.get('needs_human_total')
+            if args.question:
+                preview = request('/api/bot/materials/preview','POST',{'message':args.question,'use_model':args.model})
+                report['preview'] = {k:preview.get(k) for k in ('decision','reason_code','intent','intent_method','faq_id','reply_method','preview_mode','sent')}
+                if preview.get('faq_id') in expected:
+                    report['preview']['matches_expected_answer'] = preview.get('reply') == expected[preview['faq_id']]['answer']
+            print(json.dumps(report,ensure_ascii=False,indent=2))
+            return
         merged = merge_faqs(before, updates)
         private = root/'.local'; private.mkdir(mode=0o700, exist_ok=True)
         backup = private/('faq-backup-'+datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')+'.json')
@@ -78,5 +103,7 @@ def main():
 
 if __name__ == '__main__':
     try: main()
+    except urllib.error.HTTPError as error:
+        raise SystemExit('Local FAQ request failed: HTTP '+str(error.code)+'. No response body or credentials printed.')
     except Exception as error:
         raise SystemExit('Local FAQ update stopped: '+type(error).__name__+'. Preserve the backup and inspect locally; no credentials or response bodies are printed.')
