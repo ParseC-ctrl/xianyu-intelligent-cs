@@ -1,0 +1,78 @@
+.git
+.gitignore
+.github
+node_modules
+**/__pycache__
+**/*.py[cod]
+backend/.venv
+worker/.venv
+worker/runtime-data
+.local
+data
+test-results
+.playwright-mcp
+coverage
+.pytest_cache
+.narrafork
+docs
+handoff
+tests
+deploy/*
+# 受信任公钥随不可变镜像分发，供内置文件更新器校验签名。
+!deploy/update-signing.pub
+蒸馏
+# 文档不进镜像，但保留许可与署名文件以满足 GPL 分发要求。
+*.md
+!worker/NOTICE.md
+!LICENSE
+!LICENSING.md
+!CHANGELOG.md
+# Release 源码包内的 backend/build-info.json 必须进入构建上下文：
+# 无 Git 检出时 Dockerfile 的 --write-build-info 会保留其中的同版本发布元数据。
+*.log
+*.db
+*.db-*
+config/saas.env
+config/customer.env
+worker/.env
+# Worker 运行期敏感文件与本地状态不得进入构建上下文；模板与示例保留。
+worker/data
+worker/logs
+worker/backups
+worker/images
+worker/prompts/*_prompt.txt
+worker/**/redeem_codes.json*
+worker/**/redeem_sent.json*
+worker/**/trial_codes.json*
+worker/**/trial_sent.json*
+worker/**/pan_links.json*
+worker/**/pan_sent.json*
+worker/**/reply_rules.json*
+worker/**/legacy_delivery_ledger.json*
+worker/**/delivery_state.db*
+**/*.db.*
+**/*.sqlite
+**/*.sqlite-*
+**/*.sqlite.*
+**/*.sqlite3
+**/*.sqlite3-*
+**/*.sqlite3.*
+# 本地更新 IPC、日志、备份和签名私钥绝不进入任一构建上下文。
+update-ipc
+updater-state
+**/update-staging
+**/update-intents
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+*.zip
+*.tar
+*.tar.gz
+*.sig
+xianyusaas迭代演示UI-1.html
+智能客服交互原型UI.html
+
+# Windows handoff business assets are imported locally, not baked into the image.
+/deployment-assets/
+/MANIFEST.sha256

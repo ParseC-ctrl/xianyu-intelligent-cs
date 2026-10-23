@@ -1,0 +1,47 @@
+[Unit]
+Description=Xianyu SaaS signed release updater
+After=local-fs.target network.target
+RequiresMountsFor=/opt/xianyu-intelligent-cs /var/lib/xianyu-intelligent-cs /var/lib/xianyu-intelligent-cs-updater /var/lib/xianyu-intelligent-cs-updates
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/xianyu-intelligent-cs.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=SAAS_CURRENT_ROOT=/opt/xianyu-intelligent-cs/current
+Environment=SAAS_CURRENT_LINK=/opt/xianyu-intelligent-cs/current
+Environment=SAAS_RELEASES_DIR=/opt/xianyu-intelligent-cs/releases
+Environment=SAAS_STATE_DIR=/var/lib/xianyu-intelligent-cs
+Environment=SAAS_UPDATE_STAGING_DIR=/var/lib/xianyu-intelligent-cs/update-staging
+Environment=SAAS_UPDATE_INTENT_FILE=/var/lib/xianyu-intelligent-cs-updates/intent.json
+Environment=SAAS_UPDATER_STATE_DIR=/var/lib/xianyu-intelligent-cs-updater
+Environment=SAAS_RELEASE_KIND=standalone
+Environment=SAAS_UPDATE_PUBLIC_KEY_FILE=/etc/xianyu-intelligent-cs/update-signing.pub
+Environment=SAAS_MANAGER_RELEASES_DIR=/opt/xianyu-intelligent-cs/manager/releases
+Environment=SAAS_MANAGER_CURRENT=/opt/xianyu-intelligent-cs/manager/current
+Environment=SAAS_MANAGER_EXECUTABLE=/opt/xianyu-intelligent-cs/manager/current/xianyu-intelligent-cs
+ExecStart=/opt/xianyu-intelligent-cs/manager/current/xianyu-intelligent-cs internal consume-intent
+StateDirectory=xianyu-intelligent-cs-updater
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=15min
+UMask=0077
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_FOWNER CAP_CHOWN CAP_SETUID CAP_SETGID
+ReadWritePaths=/opt/xianyu-intelligent-cs /var/lib/xianyu-intelligent-cs /var/lib/xianyu-intelligent-cs-updater /var/lib/xianyu-intelligent-cs-updates

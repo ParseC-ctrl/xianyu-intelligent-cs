@@ -1,0 +1,751 @@
+import time
+import hashlib
+import http.cookiejar
+import json
+import os
+import re
+import threading
+
+import requests
+from loguru import logger
+from platform_profile import browser_headers
+from utils.xianyu_utils import generate_sign
+
+
+class XianyuApiError(RuntimeError):
+    """A classified platform request failure without response or secret data."""
+
+    ALLOWED_CODES = frozenset({
+        "risk_control",
+        "verification_required",
+        "session_expired",
+        "platform_busy",
+        "network_error",
+        "response_invalid",
+        "token_unavailable",
+        "account_restricted",
+    })
+
+    def __init__(self, code="token_unavailable"):
+        if code not in self.ALLOWED_CODES:
+            raise ValueError("invalid platform error code")
+        self.code = code
+        super().__init__(code)
+
+
+class XianyuAuthenticationError(XianyuApiError):
+    """A request restriction or session failure requiring protected recovery."""
+
+    ALLOWED_CODES = frozenset({"session_expired", "risk_control", "verification_required"})
+
+    def __init__(self, code):
+        if code not in self.ALLOWED_CODES:
+            raise ValueError("invalid authentication error code")
+        self.code = code
+        RuntimeError.__init__(self, code)
+
+
+class XianyuApis:
+    DEFAULT_REQUEST_TIMEOUT = (5.0, 25.0)
+    DEFAULT_TOKEN_BACKOFF = (3.0, 10.0, 30.0)
+    DEFAULT_REQUEST_BACKOFF = (0.5, 1.0)
+
+    def __init__(
+        self,
+        request_timeout=DEFAULT_REQUEST_TIMEOUT,
+        sleep_func=None,
+        token_max_attempts=2,
+        login_max_attempts=1,
+        item_max_attempts=1,
+        trade_max_attempts=1,
+        token_backoff=DEFAULT_TOKEN_BACKOFF,
+        request_backoff=DEFAULT_REQUEST_BACKOFF,
+    ):
+        if min(
+            token_max_attempts,
+            login_max_attempts,
+            item_max_attempts,
+            trade_max_attempts,
+        ) < 1:
+            raise ValueError("重试次数必须大于 0")
+
+        self.url = 'https://h5api.m.goofish.com/h5/mtop.taobao.idlemessage.pc.login.token/1.0/'
+        self.session = requests.Session()
+        self._session_lock = threading.RLock()
+        self.request_timeout = request_timeout
+        self._sleep = sleep_func or time.sleep
+        self.token_max_attempts = token_max_attempts
+        self.login_max_attempts = login_max_attempts
+        self.item_max_attempts = item_max_attempts
+        self.trade_max_attempts = trade_max_attempts
+        self.token_backoff = tuple(token_backoff)
+        self.request_backoff = tuple(request_backoff)
+        self.session.headers.update(browser_headers())
+
+    def _wait_before_retry(self, attempt, total_attempts, schedule):
+        """仅在还有预算时退避；sleep 可由测试注入。"""
+        if attempt + 1 >= total_attempts or not schedule:
+            return
+        delay = schedule[min(attempt, len(schedule) - 1)]
+        if delay > 0:
+            self._sleep(delay)
+
+    @staticmethod
+    def _validate_device_id(device_id):
+        """Validate the locally-derived device identifier before request construction."""
+        if (
+            not isinstance(device_id, str)
+            or not device_id
+            or len(device_id) > 256
+            or any(
+                not character.isascii()
+                or not (character.isalnum() or character in "-_.:")
+                for character in device_id
+            )
+        ):
+            raise ValueError("device_id is invalid")
+        return device_id
+
+    @staticmethod
+    def _validate_item_id(item_id):
+        """Only numeric Goofish item IDs are valid for the detail endpoint."""
+        if (
+            not isinstance(item_id, str)
+            or not item_id
+            or len(item_id) > 64
+            or not item_id.isascii()
+            or not item_id.isdigit()
+        ):
+            raise ValueError("item_id is invalid")
+        return item_id
+
+    @staticmethod
+    def _validate_numeric_id(value, name, max_length=64):
+        value = str(value) if isinstance(value, int) and not isinstance(value, bool) else value
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > max_length
+            or not value.isascii()
+            or not value.isdigit()
+        ):
+            raise ValueError(f"{name} is invalid")
+        return value
+
+    @classmethod
+    def _validate_session_id(cls, session_id):
+        return cls._validate_numeric_id(session_id, "session_id", 64)
+
+    @classmethod
+    def _validate_order_id(cls, order_id):
+        return cls._validate_numeric_id(order_id, "order_id", 64)
+
+    @classmethod
+    def _is_success_response(cls, payload):
+        if not isinstance(payload, dict):
+            return False
+        ret_value = payload.get("ret", [])
+        if isinstance(ret_value, str):
+            ret_value = [ret_value]
+        return bool(
+            isinstance(ret_value, (list, tuple)) and ret_value
+            and all(isinstance(value, str) and value.partition("::")[0].strip().upper() == "SUCCESS" for value in ret_value)
+            and cls._response_error_code(payload) == "token_unavailable"
+        )
+
+    @staticmethod
+    def _response_error_code(payload, status_code=None):
+        """Classify error metadata, never product data or arbitrary code substrings."""
+        if not isinstance(payload, dict):
+            return "response_invalid"
+        nodes = [payload]
+        if isinstance(payload.get("content"), dict):
+            nodes.append(payload["content"])
+        texts = []
+        for node in nodes:
+            for key in (
+                "ret", "code", "errorCode", "error_code", "retCode", "status", "statusCode",
+                "status_code", "message", "msg", "errorMsg", "errorMessage",
+            ):
+                value = node.get(key)
+                values = value[:16] if isinstance(value, (list, tuple)) else [value]
+                for text in values:
+                    if isinstance(text, str) and text.partition("::")[0].strip().upper() != "SUCCESS":
+                        texts.append(text[:4096].upper())
+        text = " ".join(texts)
+        if any(signal in text for signal in (
+            "ACCOUNT_BANNED", "USER_BANNED", "PUBLISH_FORBIDDEN", "ITEM_PUBLISH_FORBIDDEN",
+            "VIOLATION", "违规", "限制发布", "禁止发布",
+        )):
+            return "account_restricted"
+        verification_codes = {
+            "CAPTCHA", "CAPTCHA_REQUIRED", "FAIL_SYS_CAPTCHA", "FAIL_SYS_CAPTCHA_REQUIRED",
+            "SECURITY_CHECK", "SECURITY_CHECK_REQUIRED", "FAIL_SYS_SECURITY_CHECK",
+            "FAIL_SYS_SECURITY_CHECK_REQUIRED",
+        }
+        flag_nodes = nodes + ([payload["data"]] if isinstance(payload.get("data"), dict) else [])
+        if (
+            any(part.strip() in verification_codes for value in texts for part in value.split("::"))
+            or any(re.search(
+                r"(?<![不无未])(?:请|需要|必须)(?:先)?(?:完成|进行)(?:安全验证|人机验证|滑块验证|验证码验证)"
+                r"|(?<!NO )(?<!NOT )\b(?:CAPTCHA|SECURITY CHECK) (?:IS )?REQUIRED\b", value
+            ) for value in texts)
+            or any(node.get(key) is True for node in flag_nodes for key in (
+                "captchaRequired", "needCaptcha", "securityCheckRequired", "verificationRequired",
+            ))
+        ):
+            return "verification_required"
+        if any(signal in text for signal in (
+            "RGV587", "USER_VALIDATE", "USER_VALID", "LOGIN_CHECK", "/PUNISH",
+        )):
+            return "risk_control"
+        if any(signal in text for signal in (
+            "SESSION_EXPIRED", "SESSION INVALID", "TOKEN_EX", "TOKEN_EMPTY", "ILLEGAL_ACCESS",
+            "LOGIN_EXPIRED", "NOT_LOGIN", "AUTH_EXPIRED", "AUTH_INVALID",
+        )):
+            return "session_expired"
+        if any(signal in text for signal in (
+            "FAIL_SYS_BUSY", "SYSTEM_BUSY", "SERVER_BUSY", "TOO_MANY_REQUEST", "RATE_LIMIT",
+            "FREQUENCY_LIMIT", "TRAFFIC_LIMIT", "被挤爆",
+        )) or status_code in {409, 412, 429, 503}:
+            return "platform_busy"
+        return "token_unavailable"
+
+    @staticmethod
+    def _looks_like_risk_control(response):
+        """识别风控滑块/验证页（punish、RGV587、USER_VALIDATE），避免把风控当普通错误反复重试。"""
+        try:
+            text = str(getattr(response, "text", "") or "")[:8192].upper()
+            final_url = str(getattr(response, "url", "") or "").lower()
+        except Exception:
+            return False
+        if "/punish" in final_url or "x5secdata" in final_url:
+            return True
+        return any(signal in text for signal in (
+            "RGV587", "USER_VALIDATE", "_____TMD_____", "/PUNISH",
+        ))
+
+    @staticmethod
+    def _is_token_rotation(payload):
+        """True when MTOP rejected only the short-lived ``_m_h5_tk`` signing token."""
+        ret_value = payload.get("ret") if isinstance(payload, dict) else None
+        if isinstance(ret_value, str):
+            ret_value = [ret_value]
+        if not isinstance(ret_value, (list, tuple)):
+            return False
+        return any(
+            isinstance(value, str)
+            and value.partition("::")[0].strip().upper().startswith(
+                ("FAIL_SYS_TOKEN_EX", "FAIL_SYS_TOKEN_EMPTY")
+            )
+            for value in ret_value[:16]
+        )
+
+    def _cookie_items(self):
+        jar = getattr(self.session, "cookies", None)
+        if not isinstance(jar, http.cookiejar.CookieJar):
+            return None
+        return {(cookie.domain, cookie.path, cookie.name): cookie.value for cookie in jar}
+
+    def _collapse_duplicate_cookies(self, before=None):
+        """Keep one cookie per name so lookups by name never raise CookieConflictError.
+
+        cookies.txt is loaded without a domain, while platform responses set the
+        same names (``_m_h5_tk`` and others) under their own domain. Without this
+        the jar holds both until the process restarts and every signed request
+        fails. A value written by the latest response wins, then a platform-set
+        cookie over the domainless baseline. The survivor is stored without a
+        domain, like the baseline, so every platform host still receives it.
+        """
+        jar = getattr(self.session, "cookies", None)
+        if not isinstance(jar, http.cookiejar.CookieJar):
+            return
+        groups = {}
+        for cookie in list(jar):
+            groups.setdefault(cookie.name, []).append(cookie)
+        for name, group in groups.items():
+            if len(group) < 2:
+                continue
+
+            def rank(cookie):
+                fresh = before is not None and before.get(
+                    (cookie.domain, cookie.path, cookie.name)
+                ) != cookie.value
+                return fresh, bool(cookie.domain), cookie.expires or 0
+
+            keep = max(reversed(group), key=rank)
+            for cookie in group:
+                jar.clear(cookie.domain, cookie.path, cookie.name)
+            jar.set_cookie(requests.cookies.create_cookie(name, keep.value))
+
+    def _cookie_value(self, name):
+        with self._session_lock:
+            self._collapse_duplicate_cookies()
+            return self.session.cookies.get(name, "") or ""
+
+    def _post_json(self, url, **kwargs):
+        with self._session_lock:
+            before = self._cookie_items()
+            try:
+                response = self.session.post(url, timeout=self.request_timeout, **kwargs)
+            except requests.RequestException as exc:
+                raise XianyuApiError("network_error") from exc
+            except Exception as exc:
+                raise XianyuApiError("network_error") from exc
+            finally:
+                self._collapse_duplicate_cookies(before)
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            if self._looks_like_risk_control(response):
+                raise XianyuAuthenticationError("risk_control") from exc
+            raise XianyuApiError("response_invalid") from exc
+        if not isinstance(payload, dict):
+            if self._looks_like_risk_control(response):
+                raise XianyuAuthenticationError("risk_control")
+            raise XianyuApiError("response_invalid")
+        return response, payload
+
+    def _post_signed(self, endpoint, params, data, headers=None):
+        """Sign with the current ``_m_h5_tk`` and post once.
+
+        Also reports whether the response replaced the token.
+        """
+        with self._session_lock:
+            previous = self._cookie_value("_m_h5_tk")
+            params["sign"] = generate_sign(params["t"], previous.split("_")[0], data["data"])
+            if headers:
+                response, result = self._post_json(
+                    endpoint, params=params, data=data, headers=dict(headers)
+                )
+            else:
+                response, result = self._post_json(endpoint, params=params, data=data)
+            return response, result, self._cookie_value("_m_h5_tk") != previous
+
+    def _signed_mtop_request(
+        self,
+        api_name,
+        endpoint,
+        payload,
+        *,
+        attempts,
+        value_type=None,
+        headers=None,
+    ):
+        """Issue one signed request with a finite retry budget on the shared session."""
+        data_val = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+        data = {"data": data_val}
+        last_error_code = "token_unavailable"
+        for attempt in range(attempts):
+            params = {
+                "jsv": "2.7.2",
+                "appKey": "34839810",
+                "t": str(int(time.time() * 1000)),
+                "sign": "",
+                "v": "1.0",
+                "type": "originaljson",
+                "accountSite": "xianyu",
+                "dataType": "json",
+                "timeout": "20000",
+                "api": api_name,
+                "sessionOption": "AutoLoginOnly",
+                "spm_cnt": "a21ybx.im.0.0",
+            }
+            if value_type:
+                params["valueType"] = value_type
+            try:
+                response, result, rotated = self._post_signed(endpoint, params, data, headers)
+                if rotated and self._is_token_rotation(result):
+                    # MTOP expired the signing token and sent a fresh one with
+                    # the rejection; resending once is the protocol, not a
+                    # session failure.
+                    logger.info("签名令牌已更新，重新发送一次")
+                    params = dict(params, t=str(int(time.time() * 1000)))
+                    response, result, _ = self._post_signed(endpoint, params, data, headers)
+            except Exception as exc:
+                last_error_code = exc.code if isinstance(exc, XianyuApiError) else "network_error"
+                logger.warning("订单核验接口请求异常 code={}", last_error_code)
+                self._wait_before_retry(
+                    attempt, attempts, self.request_backoff
+                )
+                continue
+
+            if self._is_success_response(result):
+                return result
+
+            last_error_code = self._response_error_code(result, getattr(response, "status_code", None))
+            if last_error_code in XianyuAuthenticationError.ALLOWED_CODES:
+                logger.error("订单核验接口请求受保护 code={}", last_error_code)
+                raise XianyuAuthenticationError(last_error_code)
+            if last_error_code == "account_restricted":
+                raise XianyuApiError(last_error_code)
+            logger.warning("订单核验接口调用失败")
+            self._wait_before_retry(attempt, attempts, self.request_backoff)
+
+        raise XianyuApiError(last_error_code)
+
+    def get_message_head_info(self, session_id, item_id, session_type=1):
+        """Return the platform-owned order header for a chat session and item."""
+        session_id = self._validate_session_id(session_id)
+        item_id = self._validate_item_id(str(item_id))
+        if type(session_type) is not int or session_type not in {1, 2}:
+            raise ValueError("session_type is invalid")
+        return self._signed_mtop_request(
+            "mtop.idle.trade.pc.message.headinfo",
+            "https://h5api.m.goofish.com/h5/mtop.idle.trade.pc.message.headinfo/1.0/",
+            {
+                "itemId": item_id,
+                "sessionId": int(session_id),
+                "sessionType": session_type,
+            },
+            attempts=self.trade_max_attempts,
+            value_type="string",
+        )
+
+    def get_order_detail(self, order_id):
+        """Return seller-visible order detail for a platform order ID."""
+        order_id = self._validate_order_id(order_id)
+        return self._signed_mtop_request(
+            "mtop.idle.web.trade.order.detail",
+            "https://h5api.m.goofish.com/h5/mtop.idle.web.trade.order.detail/1.0/",
+            {"tid": order_id},
+            attempts=self.trade_max_attempts,
+            value_type="string",
+        )
+
+    def consign_dummy(self, order_id):
+        """无需邮寄发货:把待发货订单在平台上标记为已发货(虚拟物流)。"""
+        order_id = self._validate_order_id(order_id)
+        return self._signed_mtop_request(
+            "mtop.taobao.idle.logistic.consign.dummy",
+            "https://h5api.m.goofish.com/h5/mtop.taobao.idle.logistic.consign.dummy/1.0/",
+            {"orderId": order_id},
+            attempts=self.trade_max_attempts,
+            value_type="string",
+        )
+
+    SELLER_ORIGIN_HEADERS = {
+        "origin": "https://seller.goofish.com",
+        "referer": "https://seller.goofish.com/",
+    }
+    SOLD_ORDER_QUERY_CODES = (
+        "ALL",
+        "NOT_PAY",
+        "NOT_SHIP",
+        "SHIPPED",
+        "TRADE_SUCCESS",
+        "TRADE_CLOSED",
+        "REFUND",
+    )
+    MAX_SOLD_ORDER_ROWS_PER_PAGE = 50
+    MAX_SOLD_ORDER_PAGES = 20
+
+    def get_sold_orders(self, page_number=1, rows_per_page=20, query_code="NOT_SHIP", order_ids=""):
+        """List seller-side orders on seller.goofish.com.
+
+        ``query_code="NOT_SHIP"`` selects orders awaiting shipment. The seller API
+        validates the request origin, so the per-call headers point at
+        seller.goofish.com instead of the session default. Response shape:
+        ``{"items", "next_page", "total_count"}``; ``total_count`` becomes 0 on an
+        out-of-range page, so callers must paginate on ``next_page``.
+        """
+        if type(page_number) is not int or not 1 <= page_number <= 10_000:
+            raise ValueError("page_number is invalid")
+        if type(rows_per_page) is not int or not 1 <= rows_per_page <= self.MAX_SOLD_ORDER_ROWS_PER_PAGE:
+            raise ValueError("rows_per_page is invalid")
+        if query_code not in self.SOLD_ORDER_QUERY_CODES:
+            raise ValueError("query_code is invalid")
+        if order_ids is None:
+            order_ids = ""
+        if not isinstance(order_ids, str) or len(order_ids) > 4096 or any(
+            character not in "0123456789, " for character in order_ids
+        ):
+            raise ValueError("order_ids is invalid")
+        payload = {
+            "pageNumber": page_number,
+            "rowsPerPage": rows_per_page,
+            "orderIds": order_ids.strip(),
+            "queryCode": query_code,
+            "orderSearchParam": "{}",
+        }
+        result = self._signed_mtop_request(
+            "mtop.taobao.idle.trade.merchant.sold.get",
+            "https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.sold.get/1.0/",
+            payload,
+            attempts=self.trade_max_attempts,
+            value_type="string",
+            headers=self.SELLER_ORIGIN_HEADERS,
+        )
+        module = {}
+        if isinstance(result, dict):
+            data = result.get("data")
+            if isinstance(data, dict):
+                candidate = data.get("module")
+                if isinstance(candidate, dict):
+                    module = candidate
+        items = module.get("items")
+        if not isinstance(items, list):
+            items = []
+        return {
+            "items": items,
+            "next_page": bool(module.get("nextPage")),
+            "total_count": module.get("totalCount") or 0,
+        }
+
+    def upload_media(self, media_path):
+        """Upload one seller image and return the bounded platform response."""
+        if not isinstance(media_path, str) or not media_path or len(media_path) > 4096:
+            raise ValueError("media_path is invalid")
+        if not os.path.isfile(media_path):
+            raise FileNotFoundError(media_path)
+        headers = browser_headers()
+        headers["accept"] = "*/*"
+        extension = os.path.splitext(media_path)[1].lower()
+        media_type = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+        }.get(extension)
+        if not media_type:
+            raise ValueError("media_path extension is invalid")
+        params = {"floderId": "0", "appkey": "xy_chat", "_input_charset": "utf-8"}
+        with self._session_lock:
+            before = self._cookie_items()
+            try:
+                with open(media_path, "rb") as handle:
+                    response = self.session.post(
+                        "https://stream-upload.goofish.com/api/upload.api",
+                        headers=headers,
+                        params=params,
+                        files={"file": (os.path.basename(media_path), handle, media_type)},
+                        timeout=self.request_timeout,
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+            finally:
+                self._collapse_duplicate_cookies(before)
+        if not isinstance(result, dict):
+            raise XianyuApiError("response_invalid")
+        return result
+
+    def update_cookies(self, cookies):
+        with self._session_lock:
+            before = self._cookie_items()
+            self.session.cookies.update(cookies)
+            self._collapse_duplicate_cookies(before)
+
+    def cookie_header_snapshot(self):
+        """Return a thread-safe snapshot of all current in-memory cookies."""
+        with self._session_lock:
+            latest = {}
+            for cookie in self.session.cookies:
+                name = str(cookie.name)
+                value = str(cookie.value)
+                if not name or any(character in name for character in "\r\n;="):
+                    continue
+                if any(character in value for character in "\r\n;"):
+                    continue
+                latest[name] = value
+            return "; ".join(
+                f"{name}={value}" for name, value in latest.items()
+            )
+
+    def clear_duplicate_cookies(self):
+        """清理重复的cookies"""
+        with self._session_lock:
+            self._collapse_duplicate_cookies()
+        # 注意：不写回 .env！运行中轮换的 cookie（_m_h5_tk 等）只用于当前会话，
+        # 写回会覆盖人工维护的完整 cookie（含 HttpOnly unb/sgcookie），导致重启后失效。
+
+    def hasLogin(self, device_id, retry_count=0):
+        """使用同一稳定设备 ID 执行一次登录态恢复探测。"""
+        if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
+            raise ValueError("retry_count is invalid")
+        if retry_count:
+            return False
+        self._validate_device_id(device_id)
+
+        url = 'https://passport.goofish.com/newlogin/hasLogin.do'
+        params = {'appName': 'xianyu', 'fromSite': '77'}
+        with self._session_lock:
+            data = {
+                'hid': self._cookie_value('unb'),
+                'ltl': 'true',
+                'appName': 'xianyu',
+                'appEntrance': 'web',
+                '_csrf_token': self._cookie_value('XSRF-TOKEN'),
+                'umidToken': '',
+                'hsiz': self._cookie_value('cookie2'),
+                'bizParams': 'taobaoBizLoginFrom=web',
+                'mainPage': 'false',
+                'isMobile': 'false',
+                'lang': 'zh_CN',
+                'returnUrl': '',
+                'fromSite': '77',
+                'isIframe': 'true',
+                'documentReferer': browser_headers()['referer'],
+                'defaultView': 'hasLogin',
+                'umidTag': 'SERVER',
+                # 与 WebSocket/Token 使用同一稳定账号设备身份；不再混用 cna。
+                'deviceId': device_id,
+            }
+            response, res_json = self._post_json(
+                url,
+                headers=browser_headers(content_type="application/x-www-form-urlencoded"),
+                params=params,
+                data=data,
+            )
+        error_code = self._response_error_code(
+            res_json, getattr(response, "status_code", None)
+        )
+        content = res_json.get('content')
+        if isinstance(content, dict) and content.get('success') is True and error_code == "token_unavailable":
+            self.clear_duplicate_cookies()
+            logger.debug("Login恢复成功")
+            return True
+        if error_code in XianyuAuthenticationError.ALLOWED_CODES:
+            raise XianyuAuthenticationError(error_code)
+        if error_code in {"platform_busy", "account_restricted"}:
+            raise XianyuApiError(error_code)
+        logger.warning("Login恢复未确认有效")
+        return False
+
+    def _single_token_request(self, device_id, data_val):
+        params = {
+            'jsv': '2.7.2',
+            'appKey': '34839810',
+            't': str(int(time.time() * 1000)),
+            'sign': '',
+            'v': '1.0',
+            'type': 'originaljson',
+            'accountSite': 'xianyu',
+            'dataType': 'json',
+            'timeout': '20000',
+            'api': 'mtop.taobao.idlemessage.pc.login.token',
+            'sessionOption': 'AutoLoginOnly',
+            'spm_cnt': 'a21ybx.im.0.0',
+            'spm_pre': 'a21ybx.item.want.1.14ad3da6ALVq3n',
+            'log_id': '14ad3da6ALVq3n',
+        }
+        with self._session_lock:
+            token = self._cookie_value('_m_h5_tk').split('_')[0]
+            params['sign'] = generate_sign(params['t'], token, data_val)
+            response, payload = self._post_json(
+                self.url,
+                headers=browser_headers(content_type="application/x-www-form-urlencoded"),
+                params=params,
+                data={'data': data_val},
+            )
+        if self._is_success_response(payload):
+            data = payload.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("accessToken"), str) or not data.get("accessToken"):
+                raise XianyuApiError("token_unavailable")
+            self.clear_duplicate_cookies()
+            return payload
+        error_code = self._response_error_code(
+            payload, getattr(response, "status_code", None)
+        )
+        if error_code in XianyuAuthenticationError.ALLOWED_CODES:
+            raise XianyuAuthenticationError(error_code)
+        raise XianyuApiError(error_code)
+
+    def get_token(self, device_id, retry_count=0):
+        """每个调度轮次一次 Token 请求；仅 Session 恢复后允许再请求一次。"""
+        self._validate_device_id(device_id)
+        if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
+            raise ValueError("retry_count is invalid")
+        if retry_count:
+            raise XianyuApiError("token_unavailable")
+        data_val = json.dumps(
+            {
+                "appKey": "444e9908a51d1cb236a27862abc769c9",
+                "deviceId": device_id,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        try:
+            result = self._single_token_request(device_id, data_val)
+        except XianyuAuthenticationError as exc:
+            if exc.code != "session_expired":
+                logger.error("Token请求需要人工处理 code={}", exc.code)
+                raise
+            logger.warning("Token会话过期，执行本轮唯一一次Session恢复")
+            if not self.hasLogin(device_id=device_id):
+                raise XianyuAuthenticationError("session_expired") from None
+            try:
+                result = self._single_token_request(device_id, data_val)
+            except XianyuAuthenticationError as retry_exc:
+                if retry_exc.code == "session_expired":
+                    logger.error("Session恢复后Token仍过期")
+                raise
+        logger.info("Token获取成功")
+        return result
+
+    def get_item_info(self, item_id, retry_count=0):
+        """获取商品信息，自动处理token失效的情况"""
+        self._validate_item_id(item_id)
+        if isinstance(retry_count, bool) or not isinstance(retry_count, int) or retry_count < 0:
+            raise ValueError("retry_count is invalid")
+        start_attempt = retry_count
+        if start_attempt >= self.item_max_attempts:
+            logger.error("获取商品信息失败，重试次数过多")
+            return {"error": "获取商品信息失败，重试次数过多"}
+
+        data_val = json.dumps(
+            {"itemId": item_id}, ensure_ascii=True, separators=(",", ":")
+        )
+        data = {'data': data_val}
+        last_error_code = "token_unavailable"
+
+        for attempt in range(start_attempt, self.item_max_attempts):
+            params = {
+                'jsv': '2.7.2',
+                'appKey': '34839810',
+                't': str(int(time.time()) * 1000),
+                'sign': '',
+                'v': '1.0',
+                'type': 'originaljson',
+                'accountSite': 'xianyu',
+                'dataType': 'json',
+                'timeout': '20000',
+                'api': 'mtop.taobao.idle.pc.detail',
+                'sessionOption': 'AutoLoginOnly',
+                'spm_cnt': 'a21ybx.im.0.0',
+            }
+            try:
+                with self._session_lock:
+                    token = self._cookie_value('_m_h5_tk').split('_')[0]
+                    params['sign'] = generate_sign(params['t'], token, data_val)
+                    response, res_json = self._post_json(
+                        'https://h5api.m.goofish.com/h5/mtop.taobao.idle.pc.detail/1.0/',
+                        params=params,
+                        data=data,
+                    )
+            except Exception as exc:
+                last_error_code = exc.code if isinstance(exc, XianyuApiError) else "network_error"
+                logger.error("商品信息API请求异常 code={}", last_error_code)
+                self._wait_before_retry(attempt, self.item_max_attempts, self.request_backoff)
+                continue
+
+            if self._is_success_response(res_json):
+                item_ref = hashlib.sha256(str(item_id).encode("utf-8")).hexdigest()[:10]
+                logger.debug("商品信息获取成功 item={}", item_ref)
+                return res_json
+            last_error_code = self._response_error_code(res_json, getattr(response, "status_code", None))
+            if last_error_code in XianyuAuthenticationError.ALLOWED_CODES:
+                logger.error("商品信息API请求受保护 code={}", last_error_code)
+                raise XianyuAuthenticationError(last_error_code)
+            if last_error_code == "account_restricted":
+                raise XianyuApiError(last_error_code)
+
+            logger.warning("商品信息API调用失败")
+            if 'Set-Cookie' in response.headers:
+                logger.debug("检测到Set-Cookie，更新当前会话cookie")
+                self.clear_duplicate_cookies()
+            self._wait_before_retry(attempt, self.item_max_attempts, self.request_backoff)
+
+        logger.error("获取商品信息失败，已用完尝试预算")
+        return {"error": "获取商品信息失败，重试次数过多", "code": last_error_code}

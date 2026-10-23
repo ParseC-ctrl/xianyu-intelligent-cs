@@ -1,0 +1,14 @@
+[Unit]
+Description=Watch for verified Xianyu SaaS update intents
+
+[Path]
+PathExists=/var/lib/xianyu-intelligent-cs-updates/intent.json
+# The root journal, not the app-owned processing file, triggers crash/boot recovery.
+PathExists=/var/lib/xianyu-intelligent-cs-updater/active.json
+Unit=xianyu-intelligent-cs-updater.service
+MakeDirectory=true
+# First-time --initialize assigns the application group; never app-own this root.
+DirectoryMode=01770
+
+[Install]
+WantedBy=multi-user.target

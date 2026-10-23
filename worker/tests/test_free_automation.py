@@ -1,0 +1,2153 @@
+import asyncio
+import hashlib
+import json
+import os
+import sqlite3
+import tempfile
+import time
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+from context_manager import ChatContextManager
+from XianyuAgent import LLMNotReadyError, LLMServiceError, LLMTimeoutError
+from main import (
+    XianyuLive,
+    GeneratedReply,
+    _split_reply_bubbles,
+    load_automation_settings,
+    load_reply_rules,
+    validate_runtime_env,
+    within_business_hours,
+)
+
+
+API_ITEM = "1001"
+PAN_ITEM = "2002"
+MATERIAL_ITEM = "3003"
+CHAT_ID = "4004"
+BUYER_ID = "5005"
+ORDER_ID = "6006"
+
+
+def write_json(path, value):
+    path = Path(path)
+    path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+    path.chmod(0o600)
+
+
+class FakeApi:
+    def __init__(self):
+        self.session = SimpleNamespace(cookies={})
+        self.order_quantity = 1
+
+    def get_item_info(self, _item_id):
+        return {
+            "data": {
+                "itemDO": {
+                    "title": "item",
+                    "desc": "description",
+                    "soldPrice": 5,
+                    "quantity": 1,
+                    "skuList": [],
+                }
+            }
+        }
+
+    def get_message_head_info(self, _chat_id, _item_id):
+        return {
+            "data": {
+                "commonData": {
+                    "orderId": ORDER_ID,
+                    "itemId": _item_id,
+                    "seller": True,
+                }
+            }
+        }
+
+    def get_order_detail(self, _order_id):
+        return {
+            "data": {
+                "orderId": ORDER_ID,
+                "itemId": MATERIAL_ITEM,
+                "peerUserId": BUYER_ID,
+                "seller": True,
+                "status": 2,
+                "utArgs": {"orderStatus": "WAIT_SELLER_SEND_GOODS"},
+                "components": [
+                    {
+                        "render": "orderInfoVO",
+                        "data": {
+                            "itemInfo": {"buyAmount": self.order_quantity},
+                            "priceInfo": {"amount": {"value": "5.00"}},
+                        },
+                    }
+                ],
+            }
+        }
+
+    def consign_dummy(self, _order_id):
+        return {"ret": ["SUCCESS::ok"]}
+
+
+class FakeBot:
+    def __init__(
+        self,
+        reply="fallback",
+        decision="reply",
+        reason_code="ok",
+        ready_error=None,
+        config_revision=7,
+    ):
+        self.reply = reply
+        self.calls = 0
+        self.ready_calls = 0
+        self.ready_expected_revisions = []
+        self.ready_error = ready_error
+        self.config_revision = config_revision
+        self.ready_revision = config_revision
+        self.last_intent = decision
+        self.last_reason_code = reason_code
+        self.requests = []
+
+    def generate_reply_result(self, *_args, **kwargs):
+        self.calls += 1
+        self.requests.append(kwargs)
+        return {
+            "reply": self.reply,
+            "decision": self.last_intent,
+            "reason_code": self.last_reason_code,
+            "config_revision": self.config_revision,
+        }
+
+    def generate_reply(self, *_args, **kwargs):
+        return self.generate_reply_result(*_args, **kwargs)["reply"]
+
+    def ensure_ready(self, expected_config_revision):
+        self.ready_calls += 1
+        self.ready_expected_revisions.append(expected_config_revision)
+        if self.ready_error is not None:
+            raise self.ready_error
+        if self.ready_revision != expected_config_revision:
+            raise LLMNotReadyError("revision changed")
+        return self.ready_revision
+
+
+class ReplyRuleLoaderTests(unittest.TestCase):
+    def test_operations_receipt_requires_matching_content_and_known_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rules.json"
+            document = {"version": 1, "rules": [{"id": "rule-1", "keywords": ["hello"], "reply": "您好"}]}
+            digest = hashlib.sha256(json.dumps(document, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            receipt = {"plan_id": "ops-123", "item_id": "opi-456", "digest": "a" * 64, "after_hash": digest}
+            write_json(path, {**document, "_ops_receipt": receipt})
+            self.assertEqual(load_reply_rules(str(path))[0]["reply"], "您好")
+            for invalid in ({**receipt, "after_hash": "b" * 64}, {**receipt, "command": "forbidden"}, None):
+                write_json(path, {**document, "_ops_receipt": invalid})
+                with self.assertRaises(RuntimeError):
+                    load_reply_rules(str(path))
+
+    def test_first_match_and_unicode_casefold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rules.json"
+            write_json(
+                path,
+                {
+                    "version": 1,
+                    "rules": [
+                        {"id": "first", "name": "指定商品问候", "item_id": API_ITEM, "keywords": ["HELLO"], "reply": "one"},
+                        {"id": "second", "keywords": ["hello"], "reply": "two"},
+                    ],
+                },
+            )
+            rules = load_reply_rules(str(path))
+            self.assertEqual(rules[0]["name"], "指定商品问候")
+            self.assertEqual(rules[0]["item_id"], API_ITEM)
+            self.assertEqual(rules[0]["reply"], "one")
+            self.assertEqual(rules[0]["keywords"], ("hello",))
+
+    def test_malformed_rule_file_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rules.json"
+            write_json(path, {"rules": []})
+            with self.assertRaises(RuntimeError):
+                load_reply_rules(str(path))
+
+    def test_unknown_fields_and_duplicate_ids_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rules.json"
+            base = {"version": 1, "rules": []}
+            for payload in (
+                {**base, "extra": True},
+                {
+                    "version": 1,
+                    "rules": [
+                        {"id": "same", "keywords": ["a"], "reply": "a"},
+                        {"id": "same", "keywords": ["b"], "reply": "b"},
+                    ],
+                },
+            ):
+                write_json(path, payload)
+                with self.assertRaises(RuntimeError):
+                    load_reply_rules(str(path))
+
+
+class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.state = Path(self.tempdir.name)
+        write_json(
+            self.state / "pan_links.json",
+            {
+                "links": [
+                    {
+                        "url": "https://files.example.invalid/resource",
+                        "code": "TEST",
+                        "remark": "resource",
+                        "match": ["resource"],
+                    }
+                ]
+            },
+        )
+        self.products = self.state / "products.json"
+        write_json(
+            self.products,
+            {
+                "types": [
+                    {"id": "api", "item_ids": [API_ITEM], "delivery": "redeem"},
+                    {
+                        "id": "pan",
+                        "item_ids": [PAN_ITEM],
+                        "delivery": "pan",
+                        "resource_match": ["resource"],
+                    },
+                    {
+                        "id": "material",
+                        "item_ids": [MATERIAL_ITEM],
+                        "delivery": "material",
+                        "payload": "material payload",
+                    },
+                ]
+            },
+        )
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def make_agent(
+        self,
+        mode="rules",
+        rules=None,
+        bot=None,
+        settings=None,
+        seed_rules=True,
+        seed_settings=True,
+    ):
+        rules_path = self.state / "reply_rules.json"
+        if not seed_rules:
+            rules_path.unlink(missing_ok=True)
+        elif rules is not None:
+            write_json(rules_path, rules)
+        elif not rules_path.exists():
+            write_json(rules_path, {"version": 1, "rules": []})
+        settings_path = self.state / "automation_settings.json"
+        if not seed_settings:
+            settings_path.unlink(missing_ok=True)
+        elif settings is not None:
+            write_json(settings_path, settings)
+        elif not settings_path.exists():
+            write_json(
+                settings_path,
+                {"version": 1, "strategy": "standard", "enabled": True},
+            )
+        env = {
+            "AUTOMATION_MODE": mode,
+            "AUTOMATION_SETTINGS_FILE": str(settings_path),
+        }
+        return patch.dict(os.environ, env, clear=False), bot or FakeBot()
+
+    def build_agent(
+        self,
+        mode="rules",
+        rules=None,
+        bot=None,
+        settings=None,
+        seed_rules=True,
+        seed_settings=True,
+    ):
+        env_patch, bot = self.make_agent(
+            mode,
+            rules,
+            bot,
+            settings,
+            seed_rules=seed_rules,
+            seed_settings=seed_settings,
+        )
+        env_patch.start()
+        self.addAsyncCleanup(env_patch.stop)
+        agent = XianyuLive(
+            "unb=seller; token=test",
+            reply_bot=bot,
+            api_client=FakeApi(),
+            data_dir=str(self.state),
+            products_config_path=str(self.products),
+            automation_mode=mode,
+        )
+        agent.send_text_reliably = AsyncMock()
+        return agent, bot
+
+    async def test_customer_fragments_generate_only_one_combined_reply(self):
+        agent, bot = self.build_agent(mode="rules_ai")
+        agent.knowledge_only = True
+        agent._customer_conversation_scope = AsyncMock(return_value="owned")
+        agent._wait_for_buyer_pause = AsyncMock(side_effect=[(False, False), (True, False)])
+        agent._pending_buyer_fragments = Mock(return_value=False)
+        agent._local_knowledge_item_context = Mock(return_value={"item_id": API_ITEM})
+        agent._ensure_ai_reply_ready = AsyncMock()
+        agent._generate_llm_reply = AsyncMock(return_value=GeneratedReply("合并后的回复", "reply", "material_answered", 1, "a" * 64))
+        agent.human_reply_delay = AsyncMock(return_value=0)
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "我40码", "batch-a")
+        agent._generate_llm_reply.assert_not_awaited()
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "平时皮鞋", "batch-b")
+        agent._generate_llm_reply.assert_awaited_once()
+        self.assertEqual(agent._generate_llm_reply.await_args.args[0], "我40码\n平时皮鞋")
+        self.assertEqual(agent.send_text_reliably.await_count, 1)
+        self.assertEqual(agent.context_manager.get_source_message("assistant:batch-a")["role"], "assistant_no_reply")
+
+    async def test_customer_new_fragment_during_generation_suppresses_old_answer(self):
+        agent, bot = self.build_agent(mode="rules_ai")
+        agent.knowledge_only = True
+        agent._customer_conversation_scope = AsyncMock(return_value="owned")
+        agent._wait_for_buyer_pause = AsyncMock(return_value=(True, False))
+        agent._pending_buyer_fragments = Mock(return_value=True)
+        agent._local_knowledge_item_context = Mock(return_value={"item_id": API_ITEM})
+        agent._generate_llm_reply = AsyncMock(return_value=GeneratedReply("过时的答案", "reply", "material_answered", 1, "a" * 64))
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "我40码", "batch-stale")
+        agent._generate_llm_reply.assert_awaited_once()
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(agent.context_manager.get_source_message("assistant:batch-stale")["role"], "assistant_no_reply")
+
+    async def test_rules_mode_initializes_without_ai_client_or_paid_inventory(self):
+        (self.state / "pan_links.json").unlink()
+        with patch.dict(os.environ, {"AUTOMATION_MODE": "rules"}, clear=True):
+            with patch("main.XianyuReplyBot") as bot_constructor:
+                agent = XianyuLive(
+                    "unb=seller; token=test",
+                    api_client=FakeApi(),
+                    data_dir=str(self.state),
+                    products_config_path=str(self.products),
+                    automation_mode="rules",
+                )
+        bot_constructor.assert_not_called()
+        self.assertIsNone(agent.bot)
+        self.assertEqual(agent.automation_mode, "rules")
+
+    async def test_material_empty_and_unconfigured_shops_need_no_inventory_files(self):
+        (self.state / "pan_links.json").unlink()
+        material = {
+            "id": "material", "item_ids": [MATERIAL_ITEM],
+            "delivery": "material", "payload": "material payload",
+        }
+        for mode in ("rules", "rules_ai"):
+            for payload in ({"types": [material]}, {"types": []}, None):
+                with self.subTest(mode=mode, payload=payload):
+                    if payload is None:
+                        self.products.unlink()
+                    else:
+                        write_json(self.products, payload)
+                    with patch("main.DeliveryStore.import_inventory") as importer:
+                        agent, _ = self.build_agent(mode=mode)
+                    importer.assert_not_called()
+                    self.assertFalse(agent.redeem_inventory_available)
+                    self.assertEqual(agent.pan_resources, [])
+                    self.assertFalse((self.state / "redeem_codes.json").exists())
+
+    async def test_rules_inventory_import_requires_enabled_valid_mapping(self):
+        pool = self.state / "redeem_codes.json"
+        write_json(pool, [{"code": "TEST-CODE", "used": False}])
+        for payload in (
+            {"types": []},
+            {"types": [{"id": "api", "item_ids": [API_ITEM], "delivery": "redeem", "enabled": False}]},
+            {"types": [{"id": "pan", "item_ids": [PAN_ITEM], "delivery": "pan", "resource_match": ["resource"]}]},
+        ):
+            with self.subTest(payload=payload):
+                write_json(self.products, payload)
+                with patch("main.DeliveryStore.import_inventory") as importer:
+                    agent, _ = self.build_agent()
+                importer.assert_not_called()
+                self.assertEqual(agent.delivery_store.inventory_counts(), {})
+
+    async def test_empty_advanced_templates_are_unbound_drafts_on_force_start(self):
+        drafts = [
+            {"id": "draft-redeem", "delivery": "redeem", "item_ids": []},
+            {"id": "draft-pan", "delivery": "pan", "item_ids": [], "resource_match": ["resource"]},
+        ]
+        bound = json.loads(self.products.read_text(encoding="utf-8"))["types"]
+        write_json(self.state / "redeem_codes.json", [{"code": "BOUND-CODE", "used": False}])
+        for mode in ("rules", "rules_ai"):
+            with self.subTest(mode=mode):
+                write_json(self.products, {"types": [drafts[0], *bound, drafts[1]]})
+                agent, _ = self.build_agent(mode=mode)
+                agent._refresh_runtime_config(force=True)
+                self.assertEqual(set(agent.products), {API_ITEM, PAN_ITEM, MATERIAL_ITEM})
+                self.assertEqual(agent.delivery_store.inventory_counts(), {"redeem": {"available": 1}})
+                self.assertIsNone(agent.classify_item("9999"))
+
+    async def test_only_advanced_drafts_never_import_inventory_or_authorize_delivery(self):
+        write_json(self.products, {"types": [
+            {"id": "draft-redeem", "delivery": "redeem", "item_ids": []},
+            {"id": "draft-pan", "delivery": "pan", "item_ids": [], "resource_match": ["resource"]},
+        ]})
+        write_json(self.state / "redeem_codes.json", [{"code": "UNBOUND-CODE", "used": False}])
+        # A draft must not even load unbound pan resources.
+        write_json(self.state / "pan_links.json", {"links": "unbound-invalid-input"})
+        with patch("main.DeliveryStore.import_inventory") as importer:
+            agent, _ = self.build_agent()
+            agent._refresh_runtime_config(force=True)
+        importer.assert_not_called()
+        self.assertEqual(agent.products, {})
+        self.assertEqual(agent.pan_resources, [])
+        self.assertFalse(agent.redeem_inventory_available)
+        self.assertEqual(agent.delivery_store.inventory_counts(), {})
+        agent.delivery_store.record_chat_binding(CHAT_ID, BUYER_ID, MATERIAL_ITEM)
+        event = {"1": f"{CHAT_ID}@goofish", "2": 1,
+                 "3": {"redReminder": "等待卖家发货", "redReminderStyle": "1"},
+                 "4": int(time.time() * 1000)}
+        await agent.handle_paid_order(event)
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(agent.delivery_store.inventory_counts(), {})
+
+    async def test_draft_creation_and_last_unbinding_preserve_other_live_products(self):
+        document = json.loads(self.products.read_text(encoding="utf-8"))
+        write_json(self.state / "redeem_codes.json", [{"code": "BOUND-CODE", "used": False}])
+        agent, _ = self.build_agent()
+        document["types"].extend([
+            {"id": "draft-redeem", "delivery": "redeem", "item_ids": []},
+            {"id": "draft-pan", "delivery": "pan", "item_ids": [], "resource_match": ["resource"]},
+        ])
+        write_json(self.products, document)
+        agent._refresh_runtime_config()
+        self.assertEqual(set(agent.products), {API_ITEM, PAN_ITEM, MATERIAL_ITEM})
+        document["types"][0]["item_ids"] = []
+        write_json(self.products, document)
+        # Revoking the last redeem binding does not import newly added codes.
+        write_json(self.state / "redeem_codes.json", [
+            {"code": "BOUND-CODE", "used": False}, {"code": "UNBOUND-CODE", "used": False},
+        ])
+        with patch.object(agent.delivery_store, "import_inventory") as importer:
+            agent._refresh_runtime_config()
+            agent._refresh_runtime_config(force=True)
+        importer.assert_not_called()
+        self.assertEqual(set(agent.products), {PAN_ITEM, MATERIAL_ITEM})
+        self.assertFalse(agent.redeem_inventory_available)
+        self.assertEqual(agent.delivery_store.inventory_counts(), {"redeem": {"available": 1}})
+        document["types"][1]["item_ids"] = []
+        write_json(self.products, document)
+        agent._refresh_runtime_config()
+        self.assertEqual(set(agent.products), {MATERIAL_ITEM})
+        self.assertEqual(agent.pan_resources, [])
+        self.assertIsNone(agent.classify_item(API_ITEM))
+        self.assertIsNone(agent.classify_item(PAN_ITEM))
+        for index, item_id in enumerate((API_ITEM, PAN_ITEM)):
+            revoked_chat = str(7000 + index)
+            agent.delivery_store.record_chat_binding(revoked_chat, BUYER_ID, item_id)
+            await agent.handle_paid_order({
+                "1": f"{revoked_chat}@goofish", "2": 1,
+                "3": {"redReminder": "等待卖家发货", "redReminderStyle": "1"},
+                "4": int(time.time() * 1000),
+            })
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(agent.delivery_store.inventory_counts(), {"redeem": {"available": 1}})
+        agent.delivery_store.record_chat_binding(CHAT_ID, BUYER_ID, MATERIAL_ITEM)
+        event = {"1": f"{CHAT_ID}@goofish", "2": 1,
+                 "3": {"redReminder": "等待卖家发货", "redReminderStyle": "1"},
+                 "4": int(time.time() * 1000)}
+        self.assertTrue(await agent.handle_paid_order(event))
+        agent.send_text_reliably.assert_awaited_once()
+        self.assertEqual(agent.send_text_reliably.await_args.args[2], "material payload")
+
+    async def test_invalid_product_bindings_are_not_empty_drafts(self):
+        invalid_bindings = [
+            {}, {"item_ids": None}, {"item_ids": API_ITEM}, {"item_ids": {}},
+            *({"item_ids": [value]} for value in (None, True, 1.5, {}, [], "", "*", "abc", "-1", "１２", "1" * 65)),
+            {"item_ids": [API_ITEM, API_ITEM]}, {"item_ids": [API_ITEM, " " + API_ITEM]},
+        ]
+        for delivery in ("redeem", "pan", "material"):
+            for binding in invalid_bindings:
+                with self.subTest(delivery=delivery, binding=binding):
+                    write_json(self.products, {"types": [{"id": "invalid", "delivery": delivery,
+                               "payload": "private material", "resource_match": ["resource"], **binding}]})
+                    with patch("main.DeliveryStore.import_inventory") as importer:
+                        with self.assertRaises(RuntimeError):
+                            self.build_agent()
+                    importer.assert_not_called()
+        write_json(self.products, {"types": [
+            {"id": "one", "delivery": "redeem", "item_ids": [API_ITEM]},
+            {"id": "two", "delivery": "pan", "item_ids": [API_ITEM], "resource_match": ["resource"]},
+        ]})
+        with self.assertRaises(RuntimeError):
+            self.build_agent()
+
+    async def test_empty_material_scope_does_not_bypass_private_payload_validation(self):
+        material = {"id": "private", "delivery": "material", "item_ids": [], "payload": "private material"}
+        write_json(self.products, {"types": [material]})
+        with self.assertRaises(RuntimeError):
+            self.build_agent()
+        self.products.chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, "0600"):
+            self.build_agent()
+        write_json(self.products, {"types": [{**material, "payload": ""}]})
+        with self.assertRaises(RuntimeError):
+            self.build_agent()
+
+    async def test_rules_redeem_inventory_hot_loads_without_ai_or_reimport_loop(self):
+        agent, bot = self.build_agent()
+        self.assertFalse(agent.redeem_inventory_available)
+        pool = self.state / "redeem_codes.json"
+        write_json(pool, [{"code": "TEST-CODE-A", "used": False}])
+        with patch.object(
+            agent.delivery_store, "import_inventory", wraps=agent.delivery_store.import_inventory
+        ) as importer:
+            agent._refresh_runtime_config()
+            agent._refresh_runtime_config()
+        importer.assert_called_once_with(str(pool), "redeem")
+        self.assertTrue(agent.redeem_inventory_available)
+        self.assertEqual(agent.delivery_store.inventory_counts()["redeem"], {"available": 1})
+        write_json(pool, [
+            {"code": "TEST-CODE-A", "used": True},
+            {"code": "TEST-CODE-B", "used": False},
+        ])
+        agent._refresh_runtime_config()
+        self.assertEqual(agent.delivery_store.inventory_counts()["redeem"], {
+            "legacy_used": 1, "available": 1,
+        })
+        pool.unlink()
+        agent._refresh_runtime_config()
+        self.assertFalse(agent.redeem_inventory_available)
+        self.assertEqual(bot.calls, 0)
+
+    async def test_hot_enabled_redeem_mapping_imports_existing_inventory(self):
+        write_json(self.products, {"types": []})
+        write_json(self.state / "redeem_codes.json", [{"code": "TEST-HOT", "used": False}])
+        agent, _ = self.build_agent()
+        self.assertEqual(agent.delivery_store.inventory_counts(), {})
+        write_json(self.products, {
+            "types": [{"id": "api", "item_ids": [API_ITEM], "delivery": "redeem"}],
+        })
+        agent._refresh_runtime_config()
+        self.assertEqual(agent.classify_item(API_ITEM)["delivery"], "redeem")
+        self.assertEqual(agent.delivery_store.inventory_counts()["redeem"], {"available": 1})
+        write_json(self.products, {"types": []})
+        agent._refresh_runtime_config()
+        self.assertFalse(agent.redeem_inventory_available)
+        self.assertIsNone(agent.classify_item(API_ITEM))
+
+    async def test_missing_account_inventory_never_uses_legacy_application_files(self):
+        (self.state / "pan_links.json").unlink()
+        with tempfile.TemporaryDirectory() as legacy:
+            write_json(Path(legacy) / "redeem_codes.json", [{"code": "OTHER-ACCOUNT", "used": False}])
+            write_json(Path(legacy) / "pan_links.json", {"links": "must not load"})
+            with patch("main.BASE_DIR", legacy):
+                agent, _ = self.build_agent()
+        self.assertEqual(agent.delivery_store.inventory_counts(), {})
+        self.assertEqual(agent.pan_resources, [])
+        self.assertFalse(agent.redeem_inventory_available)
+
+    async def test_invalid_redeem_inventory_does_not_block_rules_or_material(self):
+        write_json(self.state / "redeem_codes.json", [{"code": "TEST-CODE", "used": "yes"}])
+        agent, bot = self.build_agent(rules={
+            "version": 1,
+            "rules": [{"id": "ready", "keywords": ["hello"], "reply": "规则正常"}],
+        })
+        self.assertFalse(agent.redeem_inventory_available)
+        self.assertEqual(agent.delivery_store.inventory_counts(), {})
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, MATERIAL_ITEM, "hello", "invalid-stock")
+        self.assertEqual(agent.send_text_reliably.await_args.args[2], "规则正常")
+        self.assertEqual(agent.classify_item(MATERIAL_ITEM)["delivery"], "material")
+        self.assertEqual(bot.calls, 0)
+
+    def test_rules_ai_runtime_validation_keeps_fixed_rules_available_without_ai_token(self):
+        with patch.dict(
+            os.environ,
+            {"AUTOMATION_MODE": "rules_ai", "COOKIES_STR": "unb=seller"},
+            clear=True,
+        ):
+            self.assertEqual(validate_runtime_env(), "rules_ai")
+
+    async def test_group_readable_material_config_is_rejected(self):
+        write_json(
+            self.products,
+            {
+                "types": [
+                    {
+                        "id": "material",
+                        "item_ids": [MATERIAL_ITEM],
+                        "delivery": "material",
+                        "payload": "must stay out of the image",
+                    }
+                ]
+            },
+        )
+        self.products.chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, "0600"):
+            self.build_agent(mode="rules")
+
+    async def test_base_mapping_without_payload_does_not_authorize_material(self):
+        write_json(
+            self.products,
+            {
+                "types": [
+                    {
+                        "id": "material",
+                        "item_ids": [MATERIAL_ITEM],
+                        "delivery": "material",
+                    }
+                ]
+            },
+        )
+        self.products.chmod(0o644)
+        agent, _bot = self.build_agent(mode="rules")
+        self.assertIsNone(agent.classify_item(MATERIAL_ITEM))
+
+    async def test_symlinked_material_config_is_rejected(self):
+        target = self.state / "tenant-products.json"
+        write_json(
+            target,
+            {
+                "types": [
+                    {
+                        "id": "material",
+                        "item_ids": [MATERIAL_ITEM],
+                        "delivery": "material",
+                        "payload": "material payload",
+                    }
+                ]
+            },
+        )
+        linked = self.state / "linked-products.json"
+        linked.symlink_to(target)
+        with self.assertRaises(RuntimeError):
+            XianyuLive(
+                "unb=seller; token=test",
+                api_client=FakeApi(),
+                data_dir=str(self.state),
+                products_config_path=str(linked),
+                automation_mode="rules",
+            )
+
+    async def test_rules_mode_is_deterministic_and_idempotent(self):
+        agent, bot = self.build_agent(
+            rules={
+                "version": 1,
+                "rules": [
+                    {
+                        "id": "greeting",
+                        "keywords": ["HELLO"],
+                        "reply": "literal [TRIAL] text",
+                    }
+                ],
+            }
+        )
+        await agent._process_buyer_chat(
+            CHAT_ID, BUYER_ID, API_ITEM, "hello", "source-1"
+        )
+        await agent._process_buyer_chat(
+            CHAT_ID, BUYER_ID, API_ITEM, "hello", "source-1"
+        )
+        agent.send_text_reliably.assert_awaited_once()
+        self.assertEqual(agent.send_text_reliably.await_args.args[2], "literal [TRIAL] text")
+        self.assertEqual(bot.calls, 0)
+
+    async def test_item_scoped_rule_only_matches_the_associated_product(self):
+        agent, _bot = self.build_agent(
+            rules={
+                "version": 1,
+                "rules": [
+                    {
+                        "id": "generic-rule",
+                        "name": "通用规则",
+                        "item_id": "",
+                        "keywords": ["价格"],
+                        "reply": "通用回复",
+                    },
+                    {
+                        "id": "item-rule",
+                        "name": "指定商品规则",
+                        "item_id": API_ITEM,
+                        "keywords": ["价格"],
+                        "reply": "指定商品回复",
+                    },
+                ],
+            }
+        )
+        self.assertEqual(agent._match_reply_rule("价格多少", API_ITEM), "指定商品回复")
+        self.assertEqual(agent._match_reply_rule("价格多少", PAN_ITEM), "通用回复")
+
+    async def test_rules_mode_unmatched_message_is_terminal_without_llm(self):
+        agent, bot = self.build_agent(
+            rules={
+                "version": 1,
+                "rules": [{"id": "x", "keywords": ["x"], "reply": "y"}],
+            }
+        )
+        await agent._process_buyer_chat(
+            CHAT_ID, BUYER_ID, API_ITEM, "unmatched", "source-2"
+        )
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(bot.calls, 0)
+        outcome = agent.context_manager.get_source_message("assistant:source-2")
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_rules_mode_uses_gemini_first_and_fallback_replies(self):
+        agent, bot = self.build_agent(
+            rules={"version": 1, "rules": []},
+            settings={
+                "version": 1,
+                "strategy": "standard",
+                "enabled": True,
+                "first_reply": "你好，在的，本店商品均支持付款后自动发货。",
+                "fallback_reply": "这个问题我稍后人工为您解答。",
+                "delay_min_seconds": 0,
+                "delay_max_seconds": 0,
+                "business_hours_enabled": False,
+                "business_start": "09:00",
+                "business_end": "23:30",
+            },
+        )
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "第一次咨询", "source-3")
+        agent.send_text_reliably.assert_awaited_once()
+        self.assertEqual(agent.send_text_reliably.await_args.args[2], "你好，在的，本店商品均支持付款后自动发货。")
+
+        agent.send_text_reliably.reset_mock()
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "另一个没命中规则的问题", "source-4")
+        agent.send_text_reliably.assert_awaited_once()
+        self.assertEqual(agent.send_text_reliably.await_args.args[2], "这个问题我稍后人工为您解答。")
+
+    def test_business_hours_validation(self):
+        settings = {"business_hours_enabled": True, "business_start": "09:00", "business_end": "17:00"}
+        self.assertTrue(within_business_hours(settings, datetime(2026, 8, 18, 10, 0)))
+        self.assertFalse(within_business_hours(settings, datetime(2026, 8, 18, 18, 0)))
+        self.assertTrue(
+            within_business_hours(
+                settings, datetime(2026, 8, 18, 1, 30, tzinfo=timezone.utc)
+            )
+        )
+        self.assertFalse(
+            within_business_hours(
+                settings, datetime(2026, 8, 18, 9, 30, tzinfo=timezone.utc)
+            )
+        )
+        overnight = {"business_hours_enabled": True, "business_start": "22:00", "business_end": "06:00"}
+        self.assertTrue(within_business_hours(overnight, datetime(2026, 8, 18, 23, 0)))
+        self.assertTrue(within_business_hours(overnight, datetime(2026, 8, 19, 5, 30)))
+        self.assertFalse(within_business_hours(overnight, datetime(2026, 8, 19, 12, 0)))
+        self.assertTrue(within_business_hours({"business_hours_enabled": False}, datetime(2026, 8, 18, 18, 0)))
+
+    async def test_configured_delay_uses_base_plus_random_component(self):
+        agent, _bot = self.build_agent(
+            settings={
+                "delay_min_seconds": 2,
+                "delay_max_seconds": 3,
+                "trigger_cooldown_seconds": 0,
+                "manual_takeover_cooldown_seconds": 0,
+            }
+        )
+        with patch("main.random.uniform", return_value=1.5):
+            delay = await agent.human_reply_delay("买家消息", "自动回复", CHAT_ID)
+        self.assertEqual(delay, 3.5)
+        agent.automation_settings["delay_min_seconds"] = 60
+        agent.automation_settings["delay_max_seconds"] = 60
+        with patch("main.random.uniform", return_value=60):
+            self.assertEqual(await agent.human_reply_delay("买家消息", "自动回复", CHAT_ID), 120.0)
+
+    async def test_trigger_cooldown_suppresses_follow_up_auto_reply(self):
+        agent, _bot = self.build_agent(
+            rules={"version": 1, "rules": []},
+            settings={
+                "first_reply": "首次回复",
+                "fallback_reply": "兜底回复",
+                "trigger_cooldown_seconds": 30,
+            },
+        )
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "第一次咨询", "cooldown-1")
+        agent.send_text_reliably.assert_awaited_once()
+
+        agent.send_text_reliably.reset_mock()
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "紧接着追问", "cooldown-2")
+        agent.send_text_reliably.assert_not_awaited()
+        outcome = agent.context_manager.get_source_message("assistant:cooldown-2")
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_rules_switch_disables_deterministic_replies(self):
+        agent, _bot = self.build_agent(
+            mode="rules",
+            rules={"version": 1, "rules": [
+                {"id": "kw", "keywords": ["价格"], "reply": "规则命中回复", "enabled": True},
+            ]},
+            settings={"rules_enabled": False, "ai_enabled": False, "fallback_reply": "兜底回复"},
+        )
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "价格多少", "rules-off-1")
+        agent.send_text_reliably.assert_not_awaited()
+        outcome = agent.context_manager.get_source_message("assistant:rules-off-1")
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_ai_switch_disables_ai_replies(self):
+        agent, _bot = self.build_agent(
+            mode="rules_ai",
+            rules={"version": 1, "rules": []},
+            settings={"rules_enabled": True, "ai_enabled": False},
+        )
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "随便问问", "ai-off-1")
+        agent.send_text_reliably.assert_not_awaited()
+        outcome = agent.context_manager.get_source_message("assistant:ai-off-1")
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_manual_exit_during_delay_is_rechecked_before_send(self):
+        agent, _bot = self.build_agent(
+            rules={"version": 1, "rules": []},
+            settings={
+                "first_reply": "首次回复",
+                "manual_takeover_cooldown_seconds": 30,
+            },
+        )
+        agent.human_reply_delay = AsyncMock(return_value=0.01)
+
+        async def change_takeover_during_delay(_seconds):
+            agent.enter_manual_mode(CHAT_ID)
+            agent.exit_manual_mode(CHAT_ID)
+
+        async def send_with_verification(_chat_id, _buyer_id, _reply, **kwargs):
+            await kwargs["before_attempt"]()
+
+        agent.send_text_reliably = AsyncMock(side_effect=send_with_verification)
+        with patch("main.asyncio.sleep", side_effect=change_takeover_during_delay):
+            await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "第一次咨询", "delay-manual-1")
+        outcome = agent.context_manager.get_source_message("assistant:delay-manual-1")
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_trigger_cooldown_is_rechecked_before_send(self):
+        agent, _bot = self.build_agent(
+            rules={"version": 1, "rules": []},
+            settings={
+                "first_reply": "首次回复",
+                "trigger_cooldown_seconds": 30,
+            },
+        )
+        agent.human_reply_delay = AsyncMock(return_value=0.01)
+
+        async def record_other_reply_during_delay(_seconds):
+            agent.delivery_store.mark_automation_reply_sent(CHAT_ID)
+
+        async def send_with_verification(_chat_id, _buyer_id, _reply, **kwargs):
+            await kwargs["before_attempt"]()
+
+        agent.send_text_reliably = AsyncMock(side_effect=send_with_verification)
+        with patch("main.asyncio.sleep", side_effect=record_other_reply_during_delay):
+            await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "第一次咨询", "delay-trigger-1")
+        outcome = agent.context_manager.get_source_message("assistant:delay-trigger-1")
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_send_attempt_suppression_does_not_close_the_websocket(self):
+        agent, _bot = self.build_agent(settings={"enabled": True})
+        websocket = AsyncMock()
+        agent.ws = websocket
+        agent.connection_ready.set()
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(agent, XianyuLive)
+
+        async def suppress_before_attempt():
+            from main import AutomationReplySuppressed
+            raise AutomationReplySuppressed("trigger_cooldown")
+
+        from main import AutomationReplySuppressed
+        with self.assertRaises(AutomationReplySuppressed):
+            await agent.send_text_reliably(
+                CHAT_ID,
+                BUYER_ID,
+                "不会发送",
+                message_key="suppressed-send",
+                before_attempt=suppress_before_attempt,
+            )
+        websocket.close.assert_not_awaited()
+        websocket.send.assert_not_awaited()
+
+    async def test_trigger_cooldown_survives_worker_restart(self):
+        settings = {
+            "version": 1,
+            "strategy": "standard",
+            "enabled": True,
+            "first_reply": "首次回复",
+            "fallback_reply": "兜底回复",
+            "trigger_cooldown_seconds": 30,
+        }
+        first_agent, _bot = self.build_agent(
+            rules={"version": 1, "rules": []},
+            settings=settings,
+        )
+        await first_agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "第一次咨询", "restart-cooldown-1")
+        first_agent.send_text_reliably.assert_awaited_once()
+
+        second_agent, _bot = self.build_agent(
+            rules={"version": 1, "rules": []},
+            settings=settings,
+        )
+        await second_agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "重启后紧接着追问", "restart-cooldown-2")
+        second_agent.send_text_reliably.assert_not_awaited()
+        outcome = second_agent.context_manager.get_source_message("assistant:restart-cooldown-2")
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_manual_takeover_cooldown_suppresses_auto_reply_after_exit(self):
+        agent, _bot = self.build_agent(
+            rules={"version": 1, "rules": []},
+            settings={
+                "first_reply": "首次回复",
+                "fallback_reply": "兜底回复",
+                "manual_takeover_cooldown_seconds": 30,
+            },
+        )
+        agent.enter_manual_mode(CHAT_ID)
+        agent.exit_manual_mode(CHAT_ID)
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "刚刚结束人工接管", "manual-cooldown-1")
+        agent.send_text_reliably.assert_not_awaited()
+        outcome = agent.context_manager.get_source_message("assistant:manual-cooldown-1")
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_external_manual_exit_event_starts_cooldown(self):
+        agent, _bot = self.build_agent(
+            rules={"version": 1, "rules": []},
+            settings={
+                "first_reply": "首次回复",
+                "fallback_reply": "兜底回复",
+                "manual_takeover_cooldown_seconds": 30,
+            },
+        )
+        self.assertEqual(agent.delivery_store.toggle_manual_mode_once("enter", CHAT_ID, 3600)[0], "manual")
+        self.assertEqual(agent.delivery_store.toggle_manual_mode_once("exit", CHAT_ID, 3600)[0], "auto")
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "API刚恢复自动模式", "manual-cooldown-2")
+        agent.send_text_reliably.assert_not_awaited()
+        outcome = agent.context_manager.get_source_message("assistant:manual-cooldown-2")
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_expired_manual_mode_starts_cooldown_at_expiry(self):
+        agent, _bot = self.build_agent(
+            rules={"version": 1, "rules": []},
+            settings={
+                "first_reply": "首次回复",
+                "fallback_reply": "兜底回复",
+                "manual_takeover_cooldown_seconds": 30,
+            },
+        )
+        clock = [1000.0]
+        agent.delivery_store.now_fn = lambda: clock[0]
+        agent.delivery_store.set_manual_mode(CHAT_ID, True, 10)
+        clock[0] = 1011.0
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "接管刚自动过期", "manual-cooldown-3")
+        agent.send_text_reliably.assert_not_awaited()
+        outcome = agent.context_manager.get_source_message("assistant:manual-cooldown-3")
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_missing_reply_rules_at_startup_fail_closed_and_hot_recovers(self):
+        agent, _bot = self.build_agent(
+            settings={"version": 1, "strategy": "standard", "enabled": True},
+            seed_rules=False,
+        )
+        self.assertFalse(agent.reply_rules_available)
+        self.assertEqual(
+            agent.automatic_reply_suppression_reason(CHAT_ID), "reply_rules_invalid"
+        )
+
+        write_json(
+            self.state / "reply_rules.json",
+            {
+                "version": 1,
+                "rules": [{"id": "restored", "keywords": ["恢复"], "reply": "已恢复"}],
+            },
+        )
+        self.assertEqual(agent._match_reply_rule("配置恢复"), "已恢复")
+        self.assertTrue(agent.reply_rules_available)
+        self.assertIsNone(agent.automatic_reply_suppression_reason(CHAT_ID))
+
+    async def test_missing_automation_settings_at_startup_fail_closed_and_hot_recovers(self):
+        agent, _bot = self.build_agent(
+            rules={
+                "version": 1,
+                "rules": [{"id": "ready", "keywords": ["测试"], "reply": "规则回复"}],
+            },
+            seed_settings=False,
+        )
+        self.assertTrue(agent.reply_rules_available)
+        self.assertFalse(agent.automation_settings["enabled"])
+        self.assertEqual(
+            agent.automatic_reply_suppression_reason(CHAT_ID), "automation_disabled"
+        )
+
+        write_json(
+            self.state / "automation_settings.json",
+            {"version": 1, "strategy": "standard", "enabled": True},
+        )
+        self.assertIsNone(agent.automatic_reply_suppression_reason(CHAT_ID))
+        self.assertTrue(agent.automation_settings["enabled"])
+        self.assertEqual(agent._match_reply_rule("测试"), "规则回复")
+
+    async def test_invalid_automation_settings_fail_closed(self):
+        path = self.state / "automation_settings.json"
+        invalid_documents = [
+            {"version": 1, "strategy": "standard", "enabled": "yes"},
+            {"version": 1, "strategy": "standard", "enabled": True, "delay_max_seconds": 61},
+            {"version": 1, "strategy": "standard", "enabled": True, "manual_takeover_cooldown_seconds": 301},
+            {"version": 1, "strategy": "standard", "enabled": True, "business_start": "25:00"},
+            {"version": 1, "strategy": "standard", "enabled": True, "unknown": "field"},
+        ]
+        for payload in invalid_documents:
+            with self.subTest(payload=payload):
+                write_json(path, payload)
+                with self.assertRaises(RuntimeError):
+                    load_automation_settings(str(path))
+
+        write_json(path, invalid_documents[0])
+        agent, _bot = self.build_agent(rules={"version": 1, "rules": []})
+        self.assertFalse(agent.automation_settings["enabled"])
+
+    async def test_hot_reload_zero_delay_yields_no_delay(self):
+        settings_path = self.state / "automation_settings.json"
+        agent, _bot = self.build_agent(
+            settings={
+                "version": 1,
+                "strategy": "standard",
+                "enabled": True,
+                "delay_min_seconds": 2,
+                "delay_max_seconds": 3,
+            }
+        )
+        write_json(settings_path, {
+            "version": 1,
+            "strategy": "standard",
+            "enabled": True,
+            "delay_min_seconds": 0,
+            "delay_max_seconds": 0,
+        })
+        agent._refresh_runtime_config()
+        self.assertEqual(await agent.human_reply_delay("买家消息", "自动回复", CHAT_ID), 0.0)
+
+    async def test_reply_rules_hot_reload_and_invalid_update_fail_closed(self):
+        initial = {
+            "version": 1,
+            "rules": [{"id": "x", "keywords": ["old"], "reply": "old reply"}],
+        }
+        agent, _bot = self.build_agent(rules=initial)
+        self.assertEqual(agent._match_reply_rule("old"), "old reply")
+
+        replacement = {
+            "version": 1,
+            "rules": [{"id": "x", "keywords": ["new"], "reply": "new reply"}],
+        }
+        write_json(self.state / "reply_rules.json", replacement)
+        self.assertEqual(agent._match_reply_rule("new"), "new reply")
+        self.assertIsNone(agent._match_reply_rule("old"))
+
+        write_json(self.state / "reply_rules.json", {"version": "bad", "rules": []})
+        self.assertIsNone(agent._match_reply_rule("new"))
+        self.assertFalse(agent.reply_rules_available)
+        self.assertEqual(
+            agent.automatic_reply_suppression_reason(CHAT_ID), "reply_rules_invalid"
+        )
+
+        write_json(self.state / "reply_rules.json", replacement)
+        self.assertEqual(agent._match_reply_rule("new"), "new reply")
+        self.assertTrue(agent.reply_rules_available)
+
+    async def test_corrupt_reply_rules_block_ai_until_signature_is_repaired(self):
+        agent, bot = self.build_agent(
+            mode="rules_ai",
+            bot=FakeBot("ai reply"),
+            rules={"version": 1, "rules": []},
+        )
+        write_json(self.state / "reply_rules.json", {"version": "bad", "rules": []})
+        await agent._process_buyer_chat(
+            CHAT_ID, BUYER_ID, API_ITEM, "真实问题", "rules-corrupt"
+        )
+        self.assertEqual(bot.calls, 0)
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(
+            agent.context_manager.get_source_message("assistant:rules-corrupt")["role"],
+            "assistant_no_reply",
+        )
+
+        write_json(self.state / "reply_rules.json", {"version": 1, "rules": []})
+        await agent._process_buyer_chat(
+            CHAT_ID, BUYER_ID, API_ITEM, "修复后的问题", "rules-repaired"
+        )
+        self.assertEqual(bot.calls, 1)
+        agent.send_text_reliably.assert_awaited_once()
+
+    async def test_rules_ai_keeps_rule_priority_and_first_question_calls_ai(self):
+        agent, bot = self.build_agent(
+            mode="rules_ai",
+            bot=FakeBot("ai reply"),
+            rules={
+                "version": 1,
+                "rules": [
+                    {"id": "rule", "keywords": ["命中"], "reply": "规则回复"}
+                ],
+            },
+            settings={
+                "first_reply": "首次回复",
+                "fallback_reply": "兜底回复",
+            },
+        )
+        async def send_with_verification(_chat_id, _buyer_id, _reply, **kwargs):
+            await kwargs["before_attempt"]()
+
+        agent.send_text_reliably = AsyncMock(side_effect=send_with_verification)
+        await agent._process_buyer_chat(
+            CHAT_ID, BUYER_ID, API_ITEM, "命中规则", "rules-ai-rule"
+        )
+        self.assertEqual(bot.ready_calls, 0)
+        await agent._process_buyer_chat(
+            "4005", BUYER_ID, API_ITEM, "首次咨询", "rules-ai-first"
+        )
+        self.assertEqual(
+            [call.args[2] for call in agent.send_text_reliably.await_args_list],
+            ["规则回复", "ai reply"],
+        )
+        self.assertEqual(bot.calls, 1)
+        self.assertEqual(bot.ready_calls, 1)
+        self.assertEqual(bot.ready_expected_revisions, [7])
+        self.assertEqual(bot.requests[0]["item_id"], API_ITEM)
+        self.assertEqual(bot.requests[0]["recent_assistant_replies"], [])
+
+    async def test_rules_ai_disable_during_delay_cancels_generated_reply(self):
+        agent, bot = self.build_agent(
+            mode="rules_ai",
+            bot=FakeBot("迟到的 AI 回复"),
+            rules={"version": 1, "rules": []},
+            settings={"enabled": True, "fallback_reply": "不得发送的兜底"},
+        )
+        agent.human_reply_delay = AsyncMock(return_value=0.01)
+
+        async def disable_during_delay(_seconds):
+            write_json(
+                self.state / "automation_settings.json",
+                {"version": 1, "strategy": "standard", "enabled": False},
+            )
+
+        with patch("main.asyncio.sleep", side_effect=disable_during_delay):
+            await agent._process_buyer_chat(
+                CHAT_ID, BUYER_ID, API_ITEM, "真实问题", "ai-disabled-during-delay"
+            )
+
+        self.assertEqual(bot.calls, 1)
+        self.assertEqual(bot.ready_calls, 0)
+        agent.send_text_reliably.assert_not_awaited()
+        outcome = agent.context_manager.get_source_message(
+            "assistant:ai-disabled-during-delay"
+        )
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_rules_ai_rule_corruption_during_delay_cancels_generated_reply(self):
+        agent, bot = self.build_agent(
+            mode="rules_ai",
+            bot=FakeBot("迟到的 AI 回复"),
+            rules={"version": 1, "rules": []},
+            settings={"enabled": True, "fallback_reply": "不得发送的兜底"},
+        )
+        agent.human_reply_delay = AsyncMock(return_value=0.01)
+
+        async def corrupt_rules_during_delay(_seconds):
+            write_json(
+                self.state / "reply_rules.json",
+                {"version": "invalid", "rules": []},
+            )
+
+        with patch("main.asyncio.sleep", side_effect=corrupt_rules_during_delay):
+            await agent._process_buyer_chat(
+                CHAT_ID, BUYER_ID, API_ITEM, "真实问题", "rules-corrupt-during-delay"
+            )
+
+        self.assertEqual(bot.calls, 1)
+        self.assertEqual(bot.ready_calls, 0)
+        agent.send_text_reliably.assert_not_awaited()
+        outcome = agent.context_manager.get_source_message(
+            "assistant:rules-corrupt-during-delay"
+        )
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_rules_ai_valid_rule_change_during_delay_cancels_generated_reply(self):
+        agent, bot = self.build_agent(
+            mode="rules_ai",
+            bot=FakeBot("旧规则版本下生成的 AI 回复"),
+            rules={"version": 1, "rules": []},
+        )
+        agent.human_reply_delay = AsyncMock(return_value=0.01)
+
+        async def add_matching_rule_during_delay(_seconds):
+            write_json(
+                self.state / "reply_rules.json",
+                {
+                    "version": 1,
+                    "rules": [
+                        {
+                            "id": "new-priority-rule",
+                            "keywords": ["真实问题"],
+                            "reply": "新规则回复",
+                        }
+                    ],
+                },
+            )
+
+        with patch("main.asyncio.sleep", side_effect=add_matching_rule_during_delay):
+            await agent._process_buyer_chat(
+                CHAT_ID,
+                BUYER_ID,
+                API_ITEM,
+                "真实问题",
+                "rules-valid-change-during-delay",
+            )
+
+        self.assertEqual(bot.calls, 1)
+        self.assertEqual(bot.ready_calls, 0)
+        agent.send_text_reliably.assert_not_awaited()
+        outcome = agent.context_manager.get_source_message(
+            "assistant:rules-valid-change-during-delay"
+        )
+        self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_rules_ai_valid_config_revision_change_cancels_old_generated_reply(self):
+        agent, bot = self.build_agent(
+            mode="rules_ai",
+            bot=FakeBot("版本 7 生成的回复", config_revision=7),
+            rules={"version": 1, "rules": []},
+        )
+        agent.human_reply_delay = AsyncMock(return_value=0.01)
+
+        async def publish_new_valid_config(_seconds):
+            bot.ready_revision = 8
+
+        async def send_with_verification(_chat_id, _buyer_id, _reply, **kwargs):
+            await kwargs["before_attempt"]()
+
+        agent.send_text_reliably = AsyncMock(side_effect=send_with_verification)
+        with patch("main.asyncio.sleep", side_effect=publish_new_valid_config):
+            await agent._process_buyer_chat(
+                CHAT_ID,
+                BUYER_ID,
+                API_ITEM,
+                "真实问题",
+                "ai-valid-revision-changed",
+            )
+
+        self.assertEqual(bot.calls, 1)
+        self.assertEqual(bot.ready_expected_revisions, [7])
+        outcome = agent.context_manager.get_source_message(
+            "assistant:ai-valid-revision-changed"
+        )
+        self.assertEqual(outcome["role"], "assistant_cancelled")
+        self.assertIsNone(
+            agent._assistant_draft_provenance(
+                "assistant:ai-valid-revision-changed"
+            )
+        )
+
+    async def test_ai_draft_replay_after_worker_restart_keeps_original_revision(self):
+        first_bot = FakeBot("稳定版本 7 草稿", config_revision=7)
+        first_agent, _ = self.build_agent(
+            mode="rules_ai",
+            bot=first_bot,
+            rules={"version": 1, "rules": []},
+        )
+        first_agent.send_text_reliably = AsyncMock(
+            side_effect=ConnectionError("offline")
+        )
+        with self.assertRaises(ConnectionError):
+            await first_agent._process_buyer_chat(
+                CHAT_ID,
+                BUYER_ID,
+                API_ITEM,
+                "需要稳定回复的问题",
+                "revision-restart",
+            )
+        first_provenance = first_agent._assistant_draft_provenance(
+            "assistant:revision-restart"
+        )
+        self.assertEqual(first_provenance["origin"], "ai")
+        self.assertEqual(first_provenance["config_revision"], 7)
+        self.assertEqual(len(first_provenance["automation_revision"]), 64)
+
+        second_bot = FakeBot("不得重新生成", config_revision=8)
+        second_bot.ready_revision = 7
+        second_agent, _ = self.build_agent(
+            mode="rules_ai",
+            bot=second_bot,
+            rules={"version": 1, "rules": []},
+        )
+
+        async def send_with_verification(_chat_id, _buyer_id, _reply, **kwargs):
+            await kwargs["before_attempt"]()
+
+        second_agent.send_text_reliably = AsyncMock(
+            side_effect=send_with_verification
+        )
+        await second_agent._process_buyer_chat(
+            CHAT_ID,
+            BUYER_ID,
+            API_ITEM,
+            "需要稳定回复的问题",
+            "revision-restart",
+        )
+
+        self.assertEqual(second_bot.calls, 0)
+        self.assertEqual(second_bot.ready_expected_revisions, [7])
+        self.assertEqual(
+            second_agent.send_text_reliably.await_args.args[2],
+            "稳定版本 7 草稿",
+        )
+        self.assertIsNone(
+            second_agent._assistant_draft_provenance(
+                "assistant:revision-restart"
+            )
+        )
+
+    async def test_rule_draft_replay_after_valid_rule_change_is_cancelled(self):
+        first_agent, _ = self.build_agent(
+            mode="rules",
+            rules={
+                "version": 1,
+                "rules": [
+                    {"id": "old-rule", "keywords": ["问题"], "reply": "旧规则回复"}
+                ],
+            },
+        )
+        first_agent.send_text_reliably = AsyncMock(
+            side_effect=ConnectionError("offline")
+        )
+        with self.assertRaises(ConnectionError):
+            await first_agent._process_buyer_chat(
+                CHAT_ID,
+                BUYER_ID,
+                API_ITEM,
+                "问题",
+                "rule-revision-restart",
+            )
+        first_provenance = first_agent._assistant_draft_provenance(
+            "assistant:rule-revision-restart"
+        )
+        self.assertEqual(first_provenance["origin"], "rule")
+        self.assertIsNone(first_provenance["config_revision"])
+        self.assertEqual(len(first_provenance["automation_revision"]), 64)
+
+        write_json(
+            self.state / "reply_rules.json",
+            {
+                "version": 1,
+                "rules": [
+                    {"id": "new-rule", "keywords": ["问题"], "reply": "新规则回复"}
+                ],
+            },
+        )
+        second_agent, _ = self.build_agent(mode="rules")
+        await second_agent._process_buyer_chat(
+            CHAT_ID,
+            BUYER_ID,
+            API_ITEM,
+            "问题",
+            "rule-revision-restart",
+        )
+
+        second_agent.send_text_reliably.assert_not_awaited()
+        outcome = second_agent.context_manager.get_source_message(
+            "assistant:rule-revision-restart"
+        )
+        self.assertEqual(outcome["role"], "assistant_cancelled")
+        self.assertIsNone(
+            second_agent._assistant_draft_provenance(
+                "assistant:rule-revision-restart"
+            )
+        )
+
+    async def test_concurrent_ai_replies_keep_request_local_config_revisions(self):
+        class PerRequestRevisionBot(FakeBot):
+            def generate_reply_result(self, user_msg, *_args, **kwargs):
+                self.calls += 1
+                self.requests.append(kwargs)
+                revision = 7 if user_msg == "版本七问题" else 8
+                return {
+                    "reply": f"版本 {revision} 回复",
+                    "decision": "reply",
+                    "reason_code": "ok",
+                    "config_revision": revision,
+                }
+
+            def ensure_ready(self, expected_config_revision):
+                self.ready_calls += 1
+                self.ready_expected_revisions.append(expected_config_revision)
+                return expected_config_revision
+
+        bot = PerRequestRevisionBot()
+        agent, _ = self.build_agent(
+            mode="rules_ai",
+            bot=bot,
+            rules={"version": 1, "rules": []},
+        )
+
+        async def send_with_verification(_chat_id, _buyer_id, _reply, **kwargs):
+            await kwargs["before_attempt"]()
+
+        agent.send_text_reliably = AsyncMock(side_effect=send_with_verification)
+        await asyncio.gather(
+            agent._process_buyer_chat(
+                "revision-chat-7",
+                BUYER_ID,
+                API_ITEM,
+                "版本七问题",
+                "revision-source-7",
+            ),
+            agent._process_buyer_chat(
+                "revision-chat-8",
+                BUYER_ID,
+                API_ITEM,
+                "版本八问题",
+                "revision-source-8",
+            ),
+        )
+
+        self.assertCountEqual(bot.ready_expected_revisions, [7, 8])
+        self.assertEqual(bot.ready_calls, 2)
+        self.assertEqual(agent.send_text_reliably.await_count, 2)
+
+    async def test_rules_ai_readiness_failures_cancel_without_closing_websocket(self):
+        # 发送前就绪校验失败不重试（重试只针对生成调用）。
+        for index, error in enumerate(
+            (
+                LLMNotReadyError("disabled"),
+                LLMServiceError("unavailable"),
+                LLMTimeoutError("timeout"),
+            )
+        ):
+            with self.subTest(error=type(error).__name__):
+                bot = FakeBot("不得发送的 AI 回复", ready_error=error)
+                agent, _ = self.build_agent(
+                    mode="rules_ai",
+                    bot=bot,
+                    rules={"version": 1, "rules": []},
+                )
+                websocket = AsyncMock()
+                agent.ws = websocket
+                agent.connection_ready.set()
+                agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(
+                    agent, XianyuLive
+                )
+                source_id = f"ready-failure-{index}"
+
+                await agent._process_buyer_chat(
+                    f"ready-chat-{index}", BUYER_ID, API_ITEM, "真实问题", source_id
+                )
+
+                self.assertEqual(bot.ready_calls, 1)
+                websocket.send.assert_not_awaited()
+                websocket.close.assert_not_awaited()
+                outcome = agent.context_manager.get_source_message(
+                    f"assistant:{source_id}"
+                )
+                self.assertEqual(outcome["role"], "assistant_cancelled")
+
+    async def test_transient_llm_failure_retries_then_replies(self):
+        class FlakyBot(FakeBot):
+            def generate_reply_result(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise LLMServiceError("unavailable")
+                return {
+                    "reply": "重试后成功",
+                    "decision": "reply",
+                    "reason_code": "ok",
+                    "config_revision": 7,
+                }
+
+        bot = FlakyBot()
+        agent, _ = self.build_agent(
+            mode="rules_ai", bot=bot, rules={"version": 1, "rules": []}
+        )
+        agent.llm_retry_delay = 0
+        websocket = AsyncMock()
+        agent.ws = websocket
+        agent.connection_ready.set()
+        agent.send_msg = AsyncMock(return_value=None)
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(
+            agent, XianyuLive
+        )
+
+        await agent._process_buyer_chat(
+            "flaky-chat", BUYER_ID, API_ITEM, "真实问题", "flaky-source"
+        )
+
+        self.assertEqual(bot.calls, 2)
+        agent.send_msg.assert_awaited()
+        outcome = agent.context_manager.get_source_message("assistant:flaky-source")
+        self.assertEqual(outcome["role"], "assistant")
+        self.assertIn("重试后成功", outcome["content"])
+
+    async def test_real_sends_are_serialized_and_spaced(self):
+        agent, _ = self.build_agent(mode="rules", rules={"version": 1, "rules": []})
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(agent, XianyuLive)
+        agent.outbound_min_interval = 0.2
+        agent.outbound_jitter = 0.0
+        agent.connection_ready.set()
+        agent.ws = SimpleNamespace()
+        in_flight = 0
+        overlaps = 0
+        starts = []
+
+        async def fake_send(_ws, _cid, _toid, _text, **_kwargs):
+            nonlocal in_flight, overlaps
+            in_flight += 1
+            overlaps = max(overlaps, in_flight)
+            starts.append(time.monotonic())
+            await asyncio.sleep(0.05)
+            in_flight -= 1
+            return None
+
+        agent.send_msg = fake_send
+        await asyncio.gather(
+            agent.send_text_reliably("c1", "b1", "第一条", message_key="k1"),
+            agent.send_text_reliably("c1", "b1", "第二条", message_key="k2"),
+            agent.send_text_reliably("c1", "b1", "第三条", message_key="k3"),
+        )
+
+        self.assertEqual(overlaps, 1, "real sends must never overlap")
+        self.assertEqual(len(starts), 3)
+        for earlier, later in zip(starts, starts[1:]):
+            self.assertGreaterEqual(later - earlier, 0.15)
+
+    async def test_send_slot_released_on_failure(self):
+        agent, _ = self.build_agent(mode="rules", rules={"version": 1, "rules": []})
+        agent.outbound_min_interval = 0.05
+        agent.outbound_jitter = 0.0
+        seen = []
+
+        async def failing():
+            seen.append("fail")
+            await asyncio.sleep(0.02)
+            raise RuntimeError("boom")
+
+        async def succeeding():
+            seen.append("ok")
+            return "sent"
+
+        with self.assertRaises(RuntimeError):
+            await agent._send_with_pacing(failing)
+        result = await agent._send_with_pacing(succeeding)
+        self.assertEqual(result, "sent")
+        self.assertEqual(seen, ["fail", "ok"])
+
+    async def test_sends_wait_for_connection_then_do_not_overlap(self):
+        agent, _ = self.build_agent(mode="rules", rules={"version": 1, "rules": []})
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(agent, XianyuLive)
+        agent.outbound_min_interval = 0.1
+        agent.outbound_jitter = 0.0
+        agent.connection_ready.clear()
+        agent.ws = SimpleNamespace()
+        sent = []
+        in_flight = 0
+        overlaps = 0
+
+        async def fake_send(_ws, _cid, _toid, text, **_kwargs):
+            nonlocal in_flight, overlaps
+            sent.append(text)
+            in_flight += 1
+            overlaps = max(overlaps, in_flight)
+            await asyncio.sleep(0.02)
+            in_flight -= 1
+            return None
+
+        agent.send_msg = fake_send
+        tasks = [
+            asyncio.create_task(
+                agent.send_text_reliably("c1", "b1", f"m{index}", message_key=f"k{index}")
+            )
+            for index in range(3)
+        ]
+        await asyncio.sleep(0.05)
+        self.assertEqual(sent, [], "sends must queue until the connection is ready")
+        agent.connection_ready.set()
+        await asyncio.gather(*tasks)
+        self.assertEqual(sorted(sent), ["m0", "m1", "m2"])
+        self.assertEqual(overlaps, 1, "ready sends must never overlap")
+
+    async def test_reconnect_retry_keeps_uuid_and_spacing(self):
+        agent, _ = self.build_agent(mode="rules", rules={"version": 1, "rules": []})
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(agent, XianyuLive)
+        agent.outbound_min_interval = 0.1
+        agent.outbound_jitter = 0.0
+        agent.connection_ready.set()
+        websocket = SimpleNamespace(close=AsyncMock(side_effect=lambda: agent.connection_ready.set()))
+        agent.ws = websocket
+        attempts = []
+        uuids = []
+        starts = []
+
+        async def flaky_send(_ws, _cid, _toid, text, message_uuid=None, **_kwargs):
+            attempts.append(text)
+            uuids.append(message_uuid)
+            starts.append(time.monotonic())
+            if len(attempts) == 1:
+                raise ConnectionError("offline")
+            return None
+
+        agent.send_msg = flaky_send
+        await agent.send_text_reliably("c1", "b1", "内容", message_key="stable-key")
+
+        self.assertEqual(len(attempts), 2, "a failed attempt must be retried once")
+        self.assertEqual(uuids[0], uuids[1], "reconnect retry must reuse the same UUID")
+        self.assertGreaterEqual(starts[1] - starts[0], 0.09)
+        self.assertTrue(agent.connection_ready.is_set(), "the refreshed connection must stay ready")
+
+    async def test_failed_send_does_not_tear_down_newer_connection(self):
+        agent, _ = self.build_agent(mode="rules", rules={"version": 1, "rules": []})
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(agent, XianyuLive)
+        agent.outbound_min_interval = 0.0
+        agent.outbound_jitter = 0.0
+        agent.connection_ready.set()
+        stale_ws = SimpleNamespace(close=AsyncMock())
+        fresh_ws = SimpleNamespace(close=AsyncMock())
+        agent.ws = stale_ws
+        calls = {"n": 0}
+
+        async def send_once(_ws, _cid, _toid, _text, **_kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                agent.ws = fresh_ws
+                raise ConnectionError("stale connection")
+            return None
+
+        agent.send_msg = send_once
+        await asyncio.wait_for(
+            agent.send_text_reliably("c1", "b1", "内容", message_key="k"), timeout=1.0
+        )
+
+        self.assertEqual(calls["n"], 2)
+        stale_ws.close.assert_not_awaited()
+        fresh_ws.close.assert_not_awaited()
+        self.assertTrue(agent.connection_ready.is_set())
+
+    async def test_cancelled_send_releases_slot(self):
+        agent, _ = self.build_agent(mode="rules", rules={"version": 1, "rules": []})
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(agent, XianyuLive)
+        agent.outbound_min_interval = 0.05
+        agent.outbound_jitter = 0.0
+        agent.connection_ready.set()
+        agent.ws = SimpleNamespace()
+        started = asyncio.Event()
+
+        async def slow_send(_ws, _cid, _toid, _text, **_kwargs):
+            started.set()
+            await asyncio.sleep(5)
+            return None
+
+        agent.send_msg = slow_send
+        task = asyncio.create_task(
+            agent.send_text_reliably("c1", "b1", "慢消息", message_key="k-slow")
+        )
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        agent.send_msg = AsyncMock(return_value=None)
+        await asyncio.wait_for(
+            agent.send_text_reliably("c1", "b1", "后续消息", message_key="k-next"),
+            timeout=1.0,
+        )
+
+    async def test_customer_scope_nickname_storage_is_scoped_and_keeps_newest_name(self):
+        context = ChatContextManager(db_path=str(self.state / "nickname-history.db"))
+        self.assertTrue(context.set_conversation_peer_name("chat-a", "peer-a", " 新昵称\n🌿 ", 200))
+        self.assertFalse(context.set_conversation_peer_name("chat-a", "peer-a", "旧昵称", 100))
+        self.assertFalse(context.set_conversation_peer_name("chat-a", "peer-a", "\x00\n", 300))
+        self.assertFalse(context.set_conversation_peer_name("chat-a", "peer-a", {"name": "错误"}, 300))
+        self.assertTrue(context.set_conversation_peer_name("chat-b", "peer-a", "另一会话", 100))
+        self.assertTrue(context.set_conversation_peer_name("chat-a", "peer-b", "另一买家", 100))
+        with sqlite3.connect(context.db_path) as con:
+            rows = con.execute(
+                "SELECT chat_id, peer_id, nickname, observed_at FROM conversation_peer_names ORDER BY chat_id, peer_id"
+            ).fetchall()
+        self.assertEqual(rows, [
+            ("chat-a", "peer-a", "新昵称 🌿", 200.0),
+            ("chat-a", "peer-b", "另一买家", 100.0),
+            ("chat-b", "peer-a", "另一会话", 100.0),
+        ])
+
+    async def test_customer_scope_nickname_uses_platform_names_and_ignores_self_and_system(self):
+        agent, _ = self.build_agent(mode="rules", settings={
+            "version": 1, "rules_enabled": False, "ai_enabled": False,
+        })
+        base_time = int(time.time() * 1000) - 1000
+
+        def message(timestamp, *, sender=BUYER_ID, nickname=None, title=None, system=False):
+            payload = {"1": {
+                "2": f"{CHAT_ID}@goofish", "5": str(timestamp),
+                "10": {"senderUserId": sender, "senderNick": nickname, "reminderTitle": title,
+                       "reminderContent": "咨询消息中的文字不作为昵称",
+                       "reminderUrl": f"fleamarket://message_chat?itemId={API_ITEM}"},
+            }}
+            if system:
+                payload["3"] = {"needPush": "false"}
+            return payload
+
+        def names():
+            with sqlite3.connect(agent.context_manager.db_path) as con:
+                return con.execute(
+                    "SELECT peer_id, nickname, observed_at FROM conversation_peer_names WHERE chat_id=? ORDER BY peer_id",
+                    (CHAT_ID,),
+                ).fetchall()
+
+        await agent._process_chat_message(message(base_time, nickname="平台昵称", title="标题备用名"))
+        self.assertEqual(names(), [(BUYER_ID, "平台昵称", base_time / 1000)])
+        await agent._process_chat_message(message(base_time + 100, title="新昵称"))
+        self.assertEqual(names(), [(BUYER_ID, "新昵称", (base_time + 100) / 1000)])
+        await agent._process_chat_message(message(base_time - 100, nickname="旧回放昵称"))
+        await agent._process_chat_message(message(base_time + 200, sender=agent.myid, nickname="店主昵称"))
+        await agent._process_chat_message(message(base_time + 300, nickname="系统提醒", system=True))
+        await agent._process_chat_message(message(base_time + 400))
+        self.assertEqual(names(), [(BUYER_ID, "新昵称", (base_time + 100) / 1000)])
+        agent.send_text_reliably.assert_not_awaited()
+
+    async def test_customer_scope_blocks_foreign_chats_for_every_reply_strategy(self):
+        for mode, rules, settings in (
+            ("rules_ai", {"version": 1, "rules": []}, {"version": 1}),
+            ("rules_ai", {"version": 1, "rules": [{"id": "greeting", "keywords": ["你好"], "reply": "规则回复"}]}, {"version": 1}),
+            ("rules", {"version": 1, "rules": []}, {"version": 1, "first_reply": "首次回复", "fallback_reply": "兜底回复"}),
+        ):
+            agent, bot = self.build_agent(mode=mode, rules=rules, settings=settings)
+            agent.xianyu.get_message_head_info = Mock(return_value={"data": {"commonData": {
+                "itemId": API_ITEM, "seller": False,
+            }}})
+            await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "你好", "foreign")
+            agent.send_text_reliably.assert_not_awaited()
+            self.assertEqual(bot.calls, 0)
+            self.assertIsNone(agent.context_manager.get_source_message("foreign"))
+        # Incoming seller replies and our outgoing shopping messages are both excluded.
+        for sender in (BUYER_ID, agent.myid):
+            await agent._process_chat_message({"1": {
+                "2": f"{CHAT_ID}@goofish", "5": str(int(time.time() * 1000)),
+                "10": {"senderUserId": sender, "reminderContent": "你好",
+                       "reminderUrl": f"fleamarket://message_chat?itemId={API_ITEM}"},
+            }})
+        self.assertEqual(len(agent.context_manager.get_context_by_chat(CHAT_ID)), 2)
+        self.assertEqual(agent.context_manager.latest_item_id_by_chat(CHAT_ID), API_ITEM)
+        agent.send_text_reliably.assert_not_awaited()
+
+    async def test_customer_scope_foreign_item_replaces_old_owned_context(self):
+        agent, bot = self.build_agent(mode="rules_ai")
+        ref = hashlib.sha256(agent.myid.encode()).hexdigest()[:16]
+        write_json(self.state / "shop_snapshot.json", {
+            "version": 1, "account_ref": ref, "products": [{"id": API_ITEM}],
+        })
+        agent.context_manager.add_message_by_chat(CHAT_ID, BUYER_ID, API_ITEM, "user", "旧商品咨询", source_id="old-item")
+        agent.xianyu.get_message_head_info = Mock(return_value={"data": {"commonData": {
+            "itemId": PAN_ITEM, "seller": False,
+        }}})
+        for index, url in enumerate((f"fleamarket://message_chat?itemId={PAN_ITEM}", "")):
+            await agent._process_chat_message({"1": {
+                "2": f"{CHAT_ID}@goofish", "5": str(int(time.time() * 1000)),
+                "10": {"senderUserId": BUYER_ID, "reminderContent": f"外店回复{index}", "reminderUrl": url},
+            }})
+        self.assertEqual(agent.context_manager.latest_item_id_by_chat(CHAT_ID), PAN_ITEM)
+        self.assertEqual(agent.context_manager.get_customer_conversation_scope(CHAT_ID, PAN_ITEM, ref)["scope"], "foreign")
+        self.assertEqual(bot.calls, 0)
+        agent.send_text_reliably.assert_not_awaited()
+
+    async def test_customer_scope_accepts_verified_snapshot_without_platform_lookup(self):
+        agent, bot = self.build_agent(mode="rules_ai")
+        write_json(self.state / "shop_snapshot.json", {
+            "version": 1, "account_ref": hashlib.sha256(agent.myid.encode()).hexdigest()[:16],
+            "products": [{"id": API_ITEM}],
+        })
+        agent.xianyu.get_message_head_info = Mock(side_effect=AssertionError("unnecessary lookup"))
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "你好", "own-snapshot")
+        self.assertEqual(bot.calls, 1)
+        agent.send_text_reliably.assert_awaited()
+        agent.xianyu.get_message_head_info.assert_not_called()
+
+    async def test_customer_scope_can_verify_unsynced_presale_listing(self):
+        agent, bot = self.build_agent(mode="rules_ai")
+        # A pre-sale chat has no order ID. A snapshot miss alone is not foreign.
+        write_json(self.state / "shop_snapshot.json", {
+            "version": 1, "account_ref": hashlib.sha256(agent.myid.encode()).hexdigest()[:16],
+            "products": [], "truncated": True,
+        })
+        agent.xianyu.get_message_head_info = Mock(return_value={"data": {"commonData": {
+            "itemId": API_ITEM, "seller": True,
+        }}})
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "你好", "own-head")
+        self.assertEqual(bot.calls, 1)
+        agent.send_text_reliably.assert_awaited()
+        agent.xianyu.get_message_head_info.assert_called_once()
+
+    async def test_customer_scope_unknown_is_silent_and_wrong_account_snapshot_is_not_proof(self):
+        agent, bot = self.build_agent(mode="rules_ai")
+        write_json(self.state / "shop_snapshot.json", {
+            "version": 1, "account_ref": "another-account", "products": [{"id": API_ITEM}],
+        })
+        for index, result in enumerate(({}, {"data": {"commonData": {"itemId": PAN_ITEM, "seller": True}}},
+                                       {"data": {"commonData": {"itemId": API_ITEM}}}, RuntimeError("offline"))):
+            agent.xianyu.get_message_head_info = Mock(side_effect=result) if isinstance(result, Exception) else Mock(return_value=result)
+            chat_id = str(8000 + index)
+            for attempt in range(2):
+                await agent._process_buyer_chat(chat_id, BUYER_ID, API_ITEM, "你好", f"unknown-{index}-{attempt}")
+            self.assertEqual(agent.xianyu.get_message_head_info.call_count, 1)
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(bot.calls, 0)
+
+    async def test_customer_scope_cancels_pending_replay_and_rechecks_before_send(self):
+        agent, bot = self.build_agent(mode="rules_ai")
+        ref = hashlib.sha256(agent.myid.encode()).hexdigest()[:16]
+        agent.context_manager.prepare_assistant_reply(CHAT_ID, agent.myid, API_ITEM, "旧回复", "assistant:foreign-draft")
+        agent.context_manager.set_customer_conversation_scope(CHAT_ID, API_ITEM, ref, "foreign")
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "你好", "foreign-draft")
+        self.assertEqual(agent.context_manager.get_source_message("assistant:foreign-draft")["role"], "assistant_cancelled")
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(bot.calls, 0)
+        transmissions = []
+        async def change_role_before_send(*args, **kwargs):
+            agent.context_manager.set_customer_conversation_scope(CHAT_ID, API_ITEM, ref, "foreign")
+            await kwargs["before_attempt"]()
+            transmissions.append(args)
+        agent.context_manager.set_customer_conversation_scope(CHAT_ID, API_ITEM, ref, "owned")
+        agent.send_text_reliably = change_role_before_send
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "你好", "changed-role")
+        self.assertEqual(transmissions, [])
+        self.assertEqual(agent.context_manager.get_source_message("assistant:changed-role")["role"], "assistant_cancelled")
+
+    async def test_expired_buyer_message_is_stored_without_replying(self):
+        agent, bot = self.build_agent(
+            mode="rules_ai",
+            bot=FakeBot("过期消息不应发送"),
+            rules={"version": 1, "rules": []},
+        )
+        agent.send_text_reliably = AsyncMock()
+        old_ms = int((time.time() - 3600) * 1000)
+        message = {
+            "1": {
+                "2": f"{CHAT_ID}@goofish",
+                "5": str(old_ms),
+                "10": {
+                    "senderUserId": BUYER_ID,
+                    "reminderUrl": f"fleamarket://message_chat?itemId={API_ITEM}",
+                    "reminderContent": "停机期间错过的买家问题",
+                },
+            }
+        }
+
+        outcome = await agent._process_chat_message(message, "expired-inbound-1")
+
+        self.assertEqual(outcome, "ignored_expired_message")
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(bot.calls, 0)
+        conn = sqlite3.connect(agent.context_manager.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT content FROM messages WHERE chat_id = ? AND role = 'user'",
+                (CHAT_ID,),
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertTrue(
+            any("停机期间错过的买家问题" in row[0] for row in rows),
+            "expired buyer message must still be stored for manual review",
+        )
+
+    async def test_rules_ai_readiness_runs_before_every_reconnect_send_attempt(self):
+        agent, bot = self.build_agent(
+            mode="rules_ai",
+            bot=FakeBot("稳定 AI 草稿"),
+            rules={"version": 1, "rules": []},
+        )
+        websocket = AsyncMock()
+        agent.ws = websocket
+        agent.connection_ready.set()
+        websocket.close.side_effect = lambda: agent.connection_ready.set()
+        agent.send_msg = AsyncMock(side_effect=[ConnectionError("offline"), None])
+        agent.send_text_reliably = XianyuLive.send_text_reliably.__get__(agent, XianyuLive)
+
+        await agent._process_buyer_chat(
+            CHAT_ID, BUYER_ID, API_ITEM, "真实问题", "ready-reconnect"
+        )
+
+        self.assertEqual(bot.calls, 1)
+        self.assertEqual(bot.ready_calls, 2)
+        self.assertEqual(bot.ready_expected_revisions, [7, 7])
+        self.assertEqual(agent.send_msg.await_count, 2)
+        first_uuid = agent.send_msg.await_args_list[0].kwargs["message_uuid"]
+        second_uuid = agent.send_msg.await_args_list[1].kwargs["message_uuid"]
+        self.assertEqual(first_uuid, second_uuid)
+        self.assertEqual(
+            agent.context_manager.get_source_message("assistant:ready-reconnect")["role"],
+            "assistant",
+        )
+
+    async def test_rules_ai_failures_and_empty_reply_never_send_fixed_fallback(self):
+        agent, _bot = self.build_agent(
+            mode="rules_ai",
+            rules={"version": 1, "rules": []},
+            settings={"fallback_reply": "兜底回复"},
+        )
+        agent._generate_llm_reply = AsyncMock(
+            side_effect=[
+                # 瞬时错误重试 3 次后仍失败 → 不再重试
+                asyncio.TimeoutError(),
+                asyncio.TimeoutError(),
+                asyncio.TimeoutError(),
+                # 非瞬时/未知错误不重试
+                RuntimeError("temporary failure"),
+                # 空回复
+                ("   ", "reply", "ok", 7),
+            ]
+        )
+
+        for index in range(3):
+            await agent._process_buyer_chat(
+                CHAT_ID,
+                BUYER_ID,
+                API_ITEM,
+                f"未命中问题 {index}",
+                f"rules-ai-fallback-{index}",
+            )
+
+        self.assertEqual(agent._generate_llm_reply.await_count, 5)
+        agent.send_text_reliably.assert_not_awaited()
+        for index in range(3):
+            outcome = agent.context_manager.get_source_message(
+                f"assistant:rules-ai-fallback-{index}"
+            )
+            self.assertEqual(outcome["role"], "assistant_no_reply")
+
+    async def test_rules_ai_budget_exhaustion_is_terminal_no_reply(self):
+        agent, _bot = self.build_agent(
+            mode="rules_ai",
+            rules={"version": 1, "rules": []},
+            settings={"fallback_reply": "预算兜底回复"},
+        )
+        agent._generate_llm_reply = AsyncMock(return_value=("不应调用", "reply", "ok", 7))
+
+        with patch.object(agent.delivery_store, "reserve_llm_budget", return_value=False):
+            await agent._process_buyer_chat(
+                CHAT_ID,
+                BUYER_ID,
+                API_ITEM,
+                "预算已用完时的问题",
+                "rules-ai-budget-fallback",
+            )
+
+        agent._generate_llm_reply.assert_not_awaited()
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(
+            agent.context_manager.get_source_message(
+                "assistant:rules-ai-budget-fallback"
+            )["role"],
+            "assistant_no_reply",
+        )
+
+    async def test_rules_ai_uses_existing_internal_reply_client(self):
+        agent, bot = self.build_agent(mode="rules_ai", bot=FakeBot("ai reply"))
+        await agent._process_buyer_chat(
+            CHAT_ID, BUYER_ID, API_ITEM, "unmatched", "source-3"
+        )
+        agent.send_text_reliably.assert_awaited_once()
+        self.assertEqual(agent.send_text_reliably.await_args.args[2], "ai reply")
+        self.assertEqual(bot.calls, 1)
+
+    async def test_recent_duplicate_ai_reply_retries_once_then_suppresses(self):
+        agent, _bot = self.build_agent(
+            mode="rules_ai",
+            rules={"version": 1, "rules": []},
+        )
+        agent.context_manager.add_message_by_chat(
+            CHAT_ID,
+            agent.myid,
+            API_ITEM,
+            "assistant",
+            "这是一条已经发送的相同回复",
+            source_id="prior-assistant",
+        )
+        agent._generate_llm_reply = AsyncMock(
+            side_effect=[
+                ("这是一条已经发送的相同回复", "reply", "ok", 7),
+                ("这是一条已经发送的相同回复", "reply", "ok", 7),
+            ]
+        )
+
+        await agent._process_buyer_chat(
+            CHAT_ID, BUYER_ID, API_ITEM, "另一个真实问题", "duplicate-ai"
+        )
+
+        self.assertEqual(agent._generate_llm_reply.await_count, 2)
+        agent.send_text_reliably.assert_not_awaited()
+        second_recent = agent._generate_llm_reply.await_args_list[1].args[4]
+        self.assertIn("这是一条已经发送的相同回复", second_recent)
+        self.assertEqual(
+            agent.context_manager.get_source_message("assistant:duplicate-ai")["role"],
+            "assistant_no_reply",
+        )
+
+    async def test_duplicate_retry_reserves_a_second_model_call_budget(self):
+        agent, _bot = self.build_agent(
+            mode="rules_ai",
+            rules={"version": 1, "rules": []},
+        )
+        agent.context_manager.add_message_by_chat(
+            CHAT_ID,
+            agent.myid,
+            API_ITEM,
+            "assistant",
+            "这是一条已经发送的相同回复",
+            source_id="prior-assistant-budget",
+        )
+        agent._generate_llm_reply = AsyncMock(
+            return_value=("这是一条已经发送的相同回复", "reply", "ok", 7)
+        )
+
+        with patch.object(
+            agent.delivery_store,
+            "reserve_llm_budget",
+            side_effect=[True, False],
+        ) as reserve_budget:
+            await agent._process_buyer_chat(
+                CHAT_ID,
+                BUYER_ID,
+                API_ITEM,
+                "另一个需要去重的问题",
+                "duplicate-ai-budget",
+            )
+
+        self.assertEqual(reserve_budget.call_count, 2)
+        agent._generate_llm_reply.assert_awaited_once()
+        agent.send_text_reliably.assert_not_awaited()
+        self.assertEqual(
+            agent.context_manager.get_source_message(
+                "assistant:duplicate-ai-budget"
+            )["role"],
+            "assistant_no_reply",
+        )
+
+    async def test_inbound_recovery_loop_continues_after_one_sqlite_error(self):
+        agent, _bot = self.build_agent()
+        agent.last_delivery_retry_at = time.time()
+        agent.last_manual_review_alert = time.time()
+        schedule_calls = 0
+
+        def schedule_pending():
+            nonlocal schedule_calls
+            schedule_calls += 1
+            if schedule_calls == 1:
+                raise sqlite3.OperationalError("database is locked")
+            raise asyncio.CancelledError()
+
+        agent._schedule_pending_inbound_events = schedule_pending
+        with patch("main.asyncio.sleep", new=AsyncMock()) as sleep:
+            with self.assertRaises(asyncio.CancelledError):
+                await agent._inbound_recovery_loop()
+
+        self.assertEqual(schedule_calls, 2)
+        sleep.assert_awaited_once_with(agent.inbound_retry_interval)
+
+    async def test_rules_mode_keeps_configured_delivery_types(self):
+        agent, _bot = self.build_agent(mode="rules")
+        self.assertEqual(agent.classify_item(API_ITEM)["delivery"], "redeem")
+        self.assertEqual(agent.classify_item(PAN_ITEM)["delivery"], "pan")
+        self.assertEqual(agent.classify_item(MATERIAL_ITEM)["delivery"], "material")
+
+    async def test_rules_ai_keeps_paid_delivery_types(self):
+        agent, _bot = self.build_agent(mode="rules_ai")
+        self.assertEqual(agent.classify_item(API_ITEM)["delivery"], "redeem")
+        self.assertEqual(agent.classify_item(PAN_ITEM)["delivery"], "pan")
+        self.assertEqual(agent.classify_item(MATERIAL_ITEM)["delivery"], "material")
+
+    async def test_disabled_material_entry_does_not_authorize_delivery(self):
+        write_json(
+            self.products,
+            {
+                "types": [
+                    {
+                        "id": "material",
+                        "item_ids": [MATERIAL_ITEM],
+                        "delivery": "material",
+                        "enabled": False,
+                        "payload": "material payload",
+                    }
+                ]
+            },
+        )
+        agent, _bot = self.build_agent(mode="rules")
+        self.assertIsNone(agent.classify_item(MATERIAL_ITEM))
+
+    async def test_verified_material_order_is_sent_once_and_persisted(self):
+        agent, _bot = self.build_agent(mode="rules")
+        agent.delivery_store.record_chat_binding(CHAT_ID, BUYER_ID, MATERIAL_ITEM)
+        event = {
+            "1": f"{CHAT_ID}@goofish",
+            "2": 1,
+            "3": {"redReminder": "等待卖家发货", "redReminderStyle": "1"},
+            "4": int(time.time() * 1000),
+        }
+        self.assertTrue(await agent.handle_paid_order(event))
+        self.assertTrue(await agent.handle_paid_order(event))
+        agent.send_text_reliably.assert_awaited_once()
+        self.assertEqual(agent.send_text_reliably.await_args.args[2], "material payload")
+        order = agent.delivery_store.get_order(agent._canonical_order_key(ORDER_ID))
+        self.assertEqual(order.status, "delivered")
+        self.assertEqual(order.payload, "material payload")
+
+    async def test_material_multi_unit_order_requires_manual_review(self):
+        agent, _bot = self.build_agent(mode="rules")
+        agent.xianyu.order_quantity = 2
+        agent.delivery_store.record_chat_binding(CHAT_ID, BUYER_ID, MATERIAL_ITEM)
+        event = {
+            "1": f"{CHAT_ID}@goofish",
+            "2": 1,
+            "3": {"redReminder": "等待卖家发货", "redReminderStyle": "1"},
+            "4": int(time.time() * 1000),
+        }
+        self.assertTrue(await agent.handle_paid_order(event))
+        agent.send_text_reliably.assert_not_awaited()
+        order = agent.delivery_store.get_order(agent._canonical_order_key(ORDER_ID))
+        self.assertEqual(order.status, "manual_review")
+        self.assertEqual(order.reason, "unsupported_quantity")
+
+
+class ConversationFlagTests(unittest.TestCase):
+    def test_needs_human_flag_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = ChatContextManager(db_path=os.path.join(tmp, "chat_history.db"))
+            self.assertFalse(manager.conversation_needs_human("chat-1"))
+            manager.set_conversation_needs_human("chat-1", True)
+            self.assertTrue(manager.conversation_needs_human("chat-1"))
+            manager.set_conversation_needs_human("chat-1", False)
+            self.assertFalse(manager.conversation_needs_human("chat-1"))
+
+
+class ReplyBubbleTests(unittest.TestCase):
+    def test_short_reply_stays_single_bubble(self):
+        self.assertEqual(_split_reply_bubbles("在的，亲～"), ["在的，亲～"])
+
+    def test_long_reply_splits_on_sentence_boundaries(self):
+        text = (
+            "亲，这款是数字学习资料哦。下单后按平台流程自动发货，"
+            "一般很快就能收到。有其他问题随时问我。"
+        )
+        bubbles = _split_reply_bubbles(text, max_chars=20)
+        self.assertGreater(len(bubbles), 1)
+        self.assertEqual("".join(bubbles), text)
+
+    def test_bubble_count_is_capped(self):
+        text = "。".join(["这是一句比较长的客服说明内容"] * 8) + "。"
+        bubbles = _split_reply_bubbles(text, max_chars=10, max_count=3)
+        self.assertLessEqual(len(bubbles), 3)
+        self.assertEqual("".join(bubbles), text)
+
+    def test_links_are_never_split(self):
+        text = "亲，资料在这里 https://example.com/a/very/long/path 请查收，有需要再找我。"
+        self.assertEqual(_split_reply_bubbles(text, max_chars=10), [text])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,1123 @@
+#!/usr/bin/env python3
+"""Signed release staging, malicious archive and rollback contracts."""
+
+from __future__ import annotations
+
+import base64
+from contextlib import contextmanager
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import shutil
+import stat
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+RUN_DIR = Path(tempfile.mkdtemp(prefix="xianyu-intelligent-cs-update-contract-"))
+SOURCE_ROOT = RUN_DIR / "source"
+STAGING_ROOT = RUN_DIR / "state" / "update-staging"
+INTENT_FILE = RUN_DIR / "state" / "update-intents" / "intent.json"
+PUBLIC_KEY_FILE = RUN_DIR / "update-signing.pub"
+os.environ.update(
+    {
+        "SAAS_CURRENT_ROOT": str(SOURCE_ROOT),
+        "SAAS_UPDATE_STAGING_DIR": str(STAGING_ROOT),
+        "SAAS_UPDATE_INTENT_FILE": str(INTENT_FILE),
+        "SAAS_UPDATE_PUBLIC_KEY_FILE": str(PUBLIC_KEY_FILE),
+        "SAAS_RELEASES_DIR": str(RUN_DIR / "install" / "releases"),
+        "SAAS_TESTING": "1",
+        "SAAS_RESTORE_WORKERS": "0",
+        "SAAS_DEPLOYMENT_MODE": "systemd",
+    }
+)
+sys.path.insert(0, str(ROOT / "backend"))
+
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
+
+from db import DB  # noqa: E402
+from update_progress import observe_preparation  # noqa: E402
+import platform_update as PLATFORM_UPDATE  # noqa: E402
+from platform_update import (  # noqa: E402
+    CACHED_MANIFEST_FILE,
+    CACHED_SIGNATURE_FILE,
+    MARKER_FILE,
+    PlatformUpdateError,
+    ReleaseAsset,
+    ReleaseInfo,
+    _asset_names,
+    _parse_release,
+    _standalone_asset_names,
+    available_rollback_versions,
+    fetch_release,
+    inspect_releases,
+    inspect_public_releases,
+    update_capabilities,
+    load_verified_candidate,
+    parse_manifest,
+    stage_release,
+    validate_candidate,
+    write_update_intent,
+)
+
+
+PRIVATE_KEY = Ed25519PrivateKey.generate()
+PUBLIC_KEY_FILE.write_bytes(
+    base64.b64encode(
+        PRIVATE_KEY.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+    )
+)
+PUBLIC_KEY_FILE.chmod(0o444)
+
+
+class FakeResponse:
+    def __init__(self, payload: bytes, status_code: int = 200, headers=None):
+        self.payload = payload
+        self.status_code = status_code
+        self.headers = {"content-length": str(len(payload)), **(headers or {})}
+        self.text = payload.decode("utf-8", "replace")
+
+    def iter_content(self, chunk_size=64 * 1024):
+        for offset in range(0, len(self.payload), max(int(chunk_size), 1)):
+            yield self.payload[offset : offset + chunk_size]
+
+    def close(self):
+        return None
+
+    def json(self):
+        return json.loads(self.payload.decode("utf-8"))
+
+
+class FakeSession:
+    def __init__(self, responses):
+        self.responses = dict(responses)
+        self.seen = []
+
+    def get(self, url, **kwargs):
+        self.seen.append((url, kwargs))
+        response = self.responses[url]
+        if callable(response):
+            response = response()
+        return response
+
+
+def write_source_root() -> None:
+    (SOURCE_ROOT / "backend").mkdir(parents=True)
+    (SOURCE_ROOT / "frontend").mkdir(parents=True)
+    package = {
+        "name": "xianyu-intelligent-cs",
+        "version": "0.1.0",
+        "dependencies": {"safe": "1.0.0"},
+        "devDependencies": {"test": "1.0.0"},
+    }
+    lock = {
+        "name": package["name"],
+        "version": package["version"],
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": package["name"],
+                "version": package["version"],
+                "dependencies": package["dependencies"],
+                "devDependencies": package["devDependencies"],
+            },
+            "node_modules/safe": {"version": "1.0.0"},
+            "node_modules/test": {"version": "1.0.0"},
+        },
+    }
+    (SOURCE_ROOT / "package.json").write_text(
+        json.dumps(package, sort_keys=True), encoding="utf-8"
+    )
+    (SOURCE_ROOT / "package-lock.json").write_text(
+        json.dumps(lock, sort_keys=True), encoding="utf-8"
+    )
+    (SOURCE_ROOT / "backend" / "requirements.txt").write_text(
+        "requests==2.32.5\ncryptography==46.0.1\n", encoding="utf-8", newline="\n"
+    )
+    (SOURCE_ROOT / "backend" / "version.py").write_text(
+        'VERSION = "0.1.0"\nASSET_VERSION = "contract-asset"\n', encoding="utf-8"
+    )
+    (SOURCE_ROOT / "frontend" / "index.html").write_text(
+        "<html>contract-asset</html>", encoding="utf-8"
+    )
+
+
+def candidate_files(version: str, *, dependency="1.0.0") -> dict[str, tuple[bytes, bool]]:
+    package = {
+        "name": "xianyu-intelligent-cs",
+        "version": version,
+        "dependencies": {"safe": dependency},
+        "devDependencies": {"test": "1.0.0"},
+    }
+    lock = {
+        "name": package["name"],
+        "version": version,
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": package["name"],
+                "version": version,
+                "dependencies": package["dependencies"],
+                "devDependencies": package["devDependencies"],
+            },
+            "node_modules/safe": {"version": dependency},
+            "node_modules/test": {"version": "1.0.0"},
+        },
+    }
+    return {
+        "package.json": (json.dumps(package, sort_keys=True).encode(), False),
+        "package-lock.json": (json.dumps(lock, sort_keys=True).encode(), False),
+        "backend/requirements.txt": (
+            b"requests==2.32.5\ncryptography==46.0.1\n",
+            False,
+        ),
+        "backend/version.py": (
+            f'VERSION = "{version}"\nASSET_VERSION = "contract-asset"\n'.encode(),
+            False,
+        ),
+        "frontend/index.html": (b"<html>contract-asset</html>", False),
+        "backend/update_maintenance.py": (
+            b"MAINTENANCE_PROTOCOL = 1\n"
+            b"raise AssertionError('candidate maintenance code must never execute')\n",
+            False,
+        ),
+        "scripts/release-check.sh": (b"#!/bin/sh\nexit 0\n", True),
+    }
+
+
+def build_bundle(
+    version: str,
+    *,
+    dependency="1.0.0",
+    extra_member=None,
+    manifest_path_override: str | None = None,
+    maintenance: bytes | bool = True,
+):
+    files = candidate_files(version, dependency=dependency)
+    if maintenance is False:
+        files.pop("backend/update_maintenance.py")
+    elif isinstance(maintenance, bytes):
+        files["backend/update_maintenance.py"] = (maintenance, False)
+    artifact_name, manifest_name, signature_name = _asset_names(version)
+    archive_buffer = io.BytesIO()
+    with tarfile.open(fileobj=archive_buffer, mode="w:gz") as archive:
+        for path, (payload, executable) in files.items():
+            info = tarfile.TarInfo(path)
+            info.size = len(payload)
+            info.mode = 0o755 if executable else 0o644
+            archive.addfile(info, io.BytesIO(payload))
+        if extra_member is not None:
+            if isinstance(extra_member, tuple):
+                member, member_payload = extra_member
+                archive.addfile(member, io.BytesIO(member_payload))
+            else:
+                archive.addfile(extra_member)
+    archive_raw = archive_buffer.getvalue()
+    manifest_files = []
+    for path, (payload, executable) in files.items():
+        manifest_files.append(
+            {
+                "path": manifest_path_override if manifest_path_override and path == "package.json" else path,
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "executable": executable,
+            }
+        )
+    manifest = {
+        "schema": 1,
+        "version": version,
+        "artifact": artifact_name,
+        "artifact_sha256": hashlib.sha256(archive_raw).hexdigest(),
+        "artifact_size": len(archive_raw),
+        "files": manifest_files,
+    }
+    manifest_raw = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":")
+    ).encode()
+    signature_raw = base64.b64encode(PRIVATE_KEY.sign(manifest_raw))
+    release = ReleaseInfo(
+        release_id=f"release-{version}",
+        version=version,
+        tag=f"v{version}",
+        published_at="2026-08-30T00:00:00Z",
+        notes=f"Release {version}",
+        prerelease="-" in version,
+        artifact=ReleaseAsset(100, artifact_name, len(archive_raw)),
+        manifest=ReleaseAsset(101, manifest_name, len(manifest_raw)),
+        signature=ReleaseAsset(102, signature_name, len(signature_raw)),
+    )
+    assets = {
+        release.artifact.api_url: FakeResponse(archive_raw),
+        release.manifest.api_url: FakeResponse(manifest_raw),
+        release.signature.api_url: FakeResponse(signature_raw),
+    }
+    return release, assets, manifest_raw, signature_raw, archive_raw
+
+
+def release_metadata(release: ReleaseInfo) -> dict:
+    return {
+        "id": release.release_id,
+        "tag_name": release.tag,
+        "draft": False,
+        "prerelease": release.prerelease,
+        "published_at": release.published_at,
+        "body": release.notes,
+        "assets": [
+            {
+                "id": release.artifact.asset_id,
+                "name": release.artifact.name,
+                "size": release.artifact.size,
+            },
+            {
+                "id": release.manifest.asset_id,
+                "name": release.manifest.name,
+                "size": release.manifest.size,
+            },
+            {
+                "id": release.signature.asset_id,
+                "name": release.signature.name,
+                "size": release.signature.size,
+            },
+        ],
+    }
+
+
+def standalone_manifest(release: ReleaseInfo) -> bytes:
+    runtime = {
+        "schema": 1,
+        "version": release.version,
+        "commit": "1" * 40,
+        "platform": "linux",
+        "architecture": "x86_64",
+        "target": "linux-x86_64",
+        "python_version": "3.12.14",
+        "python_build": "20260901-install_only_stripped",
+        "uv_version": "0.12.13",
+        "manager_protocol": 1,
+        "update_data_version": 1,
+        "backend_lock_sha256": "2" * 64,
+        "worker_lock_sha256": "3" * 64,
+    }
+    runtime_raw = json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode()
+    manager_raw = b"#!/bin/sh\nexit 0\n"
+    manifest = {
+        "schema": 2,
+        "kind": "standalone",
+        "version": release.version,
+        "artifact": release.artifact.name,
+        "artifact_sha256": "4" * 64,
+        "artifact_size": release.artifact.size,
+        "platform": "linux",
+        "architecture": "x86_64",
+        "target": "linux-x86_64",
+        "manager_protocol": 1,
+        "update_data_version": 1,
+        "runtime": runtime,
+        "files": [
+            {"path": "runtime/runtime.json", "size": len(runtime_raw),
+             "sha256": hashlib.sha256(runtime_raw).hexdigest(), "executable": False},
+            {"path": "manager/xianyu-intelligent-cs", "size": len(manager_raw),
+             "sha256": hashlib.sha256(manager_raw).hexdigest(), "executable": True},
+        ],
+    }
+    return json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+
+
+def assert_error(code: str, operation) -> None:
+    try:
+        operation()
+    except PlatformUpdateError as exc:
+        assert exc.code == code, (exc.code, code)
+    else:
+        raise AssertionError(f"expected PlatformUpdateError: {code}")
+
+
+def install_signed_release(destination: Path, version: str, *, maintenance: bytes | bool = True) -> None:
+    release, _, manifest_raw, signature_raw, _ = build_bundle(version, maintenance=maintenance)
+    files = candidate_files(version)
+    if maintenance is False:
+        files.pop("backend/update_maintenance.py")
+    elif isinstance(maintenance, bytes):
+        files["backend/update_maintenance.py"] = (maintenance, False)
+    destination.mkdir(parents=True)
+    for relative, (payload, executable) in files.items():
+        path = destination / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        path.chmod(0o755 if executable else 0o644)
+    (destination / CACHED_MANIFEST_FILE).write_bytes(manifest_raw)
+    (destination / CACHED_SIGNATURE_FILE).write_bytes(signature_raw)
+    marker = {
+        "schema": 1,
+        "version": version,
+        "channel": "stable",
+        "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "release_id": release.release_id,
+        "artifact": release.artifact.name,
+        "artifact_size": release.artifact.size,
+    }
+    (destination / MARKER_FILE).write_text(
+        json.dumps(marker, sort_keys=True), encoding="utf-8"
+    )
+    for internal in (CACHED_MANIFEST_FILE, CACHED_SIGNATURE_FILE, MARKER_FILE):
+        (destination / internal).chmod(0o600)
+
+
+def install_signed_standalone_release(
+    destination: Path,
+    version: str,
+    *,
+    update_data_version: int = 1,
+    manager_protocol: int = 1,
+) -> None:
+    architecture = PLATFORM_UPDATE._standalone_architecture()
+    target = f"linux-{architecture}"
+    artifact_name, _, _ = _standalone_asset_names(version)
+    runtime = {
+        "schema": 1,
+        "version": version,
+        "commit": "1" * 40,
+        "platform": "linux",
+        "architecture": architecture,
+        "target": target,
+        "python_version": "3.12.14",
+        "python_build": "20260901-install_only_stripped",
+        "uv_version": "0.12.13",
+        "manager_protocol": manager_protocol,
+        "update_data_version": update_data_version,
+        "backend_lock_sha256": "2" * 64,
+        "worker_lock_sha256": "3" * 64,
+    }
+    files = {
+        "package.json": (json.dumps({"name": "xianyu-intelligent-cs", "version": version,
+                                      "dependencies": {"fixture": version}}, sort_keys=True).encode(), False),
+        "backend/version.py": (f'VERSION = "{version}"\nUPDATE_DATA_VERSION = {update_data_version}\n'.encode(), False),
+        "backend/update_maintenance.py": (b"MAINTENANCE_PROTOCOL = 1\n", False),
+        "runtime/runtime.json": (json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode(), False),
+        "manager/xianyu-intelligent-cs": (b"#!/bin/sh\nexit 0\n", True),
+    }
+    records = [
+        {"path": relative, "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+         "executable": executable}
+        for relative, (payload, executable) in sorted(files.items())
+    ]
+    manifest = {
+        "schema": 2,
+        "kind": "standalone",
+        "version": version,
+        "artifact": artifact_name,
+        "artifact_sha256": "4" * 64,
+        "artifact_size": 8,
+        "platform": "linux",
+        "architecture": architecture,
+        "target": target,
+        "manager_protocol": manager_protocol,
+        "update_data_version": update_data_version,
+        "runtime": runtime,
+        "files": records,
+    }
+    manifest_raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    signature_raw = base64.b64encode(PRIVATE_KEY.sign(manifest_raw))
+    destination.mkdir(parents=True)
+    for relative, (payload, executable) in files.items():
+        path = destination / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        path.chmod(0o755 if executable else 0o644)
+    (destination / CACHED_MANIFEST_FILE).write_bytes(manifest_raw)
+    (destination / CACHED_SIGNATURE_FILE).write_bytes(signature_raw)
+    (destination / MARKER_FILE).write_text(json.dumps({
+        "schema": 1,
+        "version": version,
+        "channel": "stable",
+        "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "release_id": f"standalone-{version}",
+        "artifact": artifact_name,
+        "artifact_size": 8,
+        "kind": "standalone",
+        "target": target,
+    }, sort_keys=True), encoding="utf-8")
+    for internal in (CACHED_MANIFEST_FILE, CACHED_SIGNATURE_FILE, MARKER_FILE):
+        (destination / internal).chmod(0o600)
+
+
+@contextmanager
+def trusted_rollback_fixture(releases: Path):
+    """Inject only this fixture's provisioning boundary outside isolated Linux root."""
+    if os.name == "posix" and os.geteuid() == 0:
+        yield
+        return
+    from platform_update import _trusted_update_directory
+
+    actual_lstat = Path.lstat
+
+    def fixture_directory(path, *, writable=False):
+        if path != releases and releases not in path.parents:
+            return _trusted_update_directory(path, writable=writable)
+        assert not writable, "the rollback reader must not request write access"
+        if os.name == "posix":
+            # Keep real directory/type/mode checks, accepting only the real test UID.
+            _trusted_update_directory(path, writable=True)
+        else:
+            assert path.is_dir() and not path.is_symlink()
+
+    def fixture_owner(path, *args, **kwargs):
+        metadata = actual_lstat(path, *args, **kwargs)
+        if path == releases or releases in path.parents:
+            values = list(metadata)
+            values[4] = 0
+            if os.name != "posix":
+                values[0] &= ~0o022
+            return os.stat_result(values)
+        return metadata
+
+    with patch("platform_update._trusted_update_directory", side_effect=fixture_directory), \
+         patch.object(Path, "lstat", fixture_owner):
+        yield
+
+
+def load_updater_module():
+    path = ROOT / "deploy" / "updater" / "updater.py"
+    spec = importlib.util.spec_from_file_location("xianyu_contract_updater", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def main() -> None:
+    write_source_root()
+    stable, stable_assets, _, _, _ = build_bundle("0.2.0")
+    beta, _, _, _, _ = build_bundle("0.3.0-beta.1")
+    metadata_url = "https://api.github.com/repos/ParseC-ctrl/xianyu-intelligent-cs/releases?per_page=30"
+    metadata = [
+        {"tag_name": "nightly", "draft": False},
+        release_metadata(beta),
+        release_metadata(stable),
+    ]
+    session = FakeSession(
+        {
+            metadata_url: FakeResponse(json.dumps(metadata).encode()),
+            **stable_assets,
+        }
+    )
+    selected = fetch_release("stable", "0.1.0", session=session)
+    assert selected is not None and selected.version == "0.2.0"
+    assert all(call[1]["allow_redirects"] is False for call in session.seen)
+
+    def inspect_metadata(items, channel="stable", current="0.1.0"):
+        return inspect_releases(channel, current, session=FakeSession({
+            metadata_url: FakeResponse(json.dumps(items).encode()),
+        }))
+
+    public_url = "https://api.github.com/repos/ParseC-ctrl/xianyu-intelligent-cs/releases?per_page=100&page=1"
+
+    def public_metadata(items, current="0.1.0"):
+        return inspect_public_releases(current, session=FakeSession({
+            public_url: FakeResponse(json.dumps(items).encode()),
+        }))
+
+    assert public_metadata([])["status"] == "no_release"
+    # Public release discovery is not signed-installer validation. Pre-releases
+    # and normal releases participate in the same semantic version comparison.
+    published = [{"tag_name": "v0.2.0", "draft": False, "assets": []},
+                 {"tag_name": "v0.3.0-beta.1", "draft": False, "prerelease": True},
+                 {"tag_name": "v9.0.0", "draft": True}]
+    found = public_metadata(published)
+    assert found["version"] == "0.3.0-beta.1" and found["available"] is True
+    assert found["status"] == "available" and found["channel"] == "release"
+    assert public_metadata(published, current="0.3.0")["status"] == "current"
+    published.append({"tag_name": "v0.3.0", "draft": False, "assets": []})
+    assert public_metadata(published)["version"] == "0.3.0"
+    first_page = [{"tag_name": f"v0.1.{n}", "draft": False} for n in range(100)]
+    paged = FakeSession({
+        public_url: FakeResponse(json.dumps(first_page).encode()),
+        public_url.replace("&page=1", "&page=2"): FakeResponse(json.dumps([
+            {"tag_name": "v1.0.0", "draft": False, "assets": []},
+        ]).encode()),
+    })
+    assert inspect_public_releases("0.1.0", session=paged)["version"] == "1.0.0"
+    assert len(paged.seen) == 2
+    assert_error("update_source_invalid", lambda: inspect_public_releases("0.1.0", session=FakeSession({
+        public_url: FakeResponse(b'{"error":"bad response"}'),
+    })))
+    assert_error("update_redirect_rejected", lambda: inspect_public_releases("0.1.0", session=FakeSession({
+        public_url: FakeResponse(b"", status_code=302, headers={"location": "https://evil.invalid"}),
+    })))
+
+    assert inspect_metadata([])[0]["status"] == "no_release"
+    assert inspect_metadata([release_metadata(beta)])[0]["status"] == "no_release"
+    assert inspect_metadata([release_metadata(beta)], "beta")[0]["status"] == "available"
+    old_without_assets = {"tag_name": "v0.1.0", "draft": False, "assets": []}
+    assert inspect_metadata([old_without_assets])[0]["status"] == "current"
+    assert inspect_metadata([old_without_assets, release_metadata(stable)])[1].version == "0.2.0"
+    incomplete, release = inspect_metadata([{**release_metadata(stable), "assets": []}])
+    assert incomplete["status"] == "incomplete" and incomplete["available"] is True and release is None
+    assert incomplete["version"] == "0.2.0" and incomplete["error_code"] == "release_assets_missing"
+    assert inspect_metadata([release_metadata(stable)], current="0.3.0")[0]["status"] == "current"
+
+    standalone_names = (
+        "xianyu-intelligent-cs-0.4.0-linux-x86_64.tar.gz",
+        "xianyu-intelligent-cs-0.4.0-linux-x86_64.manifest.json",
+        "xianyu-intelligent-cs-0.4.0-linux-x86_64.manifest.sig",
+    )
+    standalone_raw = {
+        "id": 400,
+        "tag_name": "v0.4.0",
+        "draft": False,
+        "prerelease": False,
+        "assets": [
+            {"id": 401, "name": standalone_names[0], "size": 256 * 1024 * 1024},
+            {"id": 402, "name": standalone_names[1], "size": 2 * 1024 * 1024},
+            {"id": 403, "name": standalone_names[2], "size": 64},
+        ],
+    }
+    with patch.dict(os.environ, {"SAAS_RELEASE_KIND": "standalone"}, clear=False), \
+         patch("platform_update.deployment_kind", return_value="systemd"), \
+         patch("platform_update._standalone_target", return_value="linux-x86_64"), \
+         patch("platform_update._standalone_asset_names", return_value=standalone_names):
+        standalone_release = _parse_release(standalone_raw, "stable", deployment="systemd")
+    assert standalone_release is not None
+    assert standalone_release.kind == "standalone" and standalone_release.target == "linux-x86_64"
+    parsed_standalone, standalone_files = parse_manifest(
+        standalone_manifest(standalone_release), standalone_release
+    )
+    assert parsed_standalone["schema"] == 2
+    assert set(standalone_files) == {"runtime/runtime.json", "manager/xianyu-intelligent-cs"}
+    mismatched = json.loads(standalone_manifest(standalone_release))
+    mismatched["target"] = "linux-aarch64"
+    assert_error(
+        "standalone_runtime_architecture_mismatch",
+        lambda: parse_manifest(json.dumps(mismatched).encode(), standalone_release),
+    )
+
+    with patch("platform_update.deployment_kind", return_value="docker"), patch("platform_update._systemd_update_ready") as probe:
+        capabilities = update_capabilities()
+        assert capabilities["check"] and not capabilities["apply"] and not capabilities["download"]
+        probe.assert_not_called()
+    with patch("platform_update.deployment_kind", return_value="systemd"):
+        with patch("platform_update._systemd_update_ready", side_effect=PlatformUpdateError("update_service_unavailable")):
+            assert update_capabilities()["reason"] == "update_service_unavailable"
+            assert not update_capabilities()["rollback"]
+        with patch("platform_update._systemd_update_ready"):
+            assert update_capabilities()["apply"] is True
+
+    redirect = FakeSession(
+        {metadata_url: FakeResponse(b"", status_code=302, headers={"location": "https://evil.invalid"})}
+    )
+    assert_error(
+        "update_redirect_rejected",
+        lambda: fetch_release("stable", "0.1.0", session=redirect),
+    )
+
+    progress = []
+    with observe_preparation(progress.append):
+        staged = stage_release(stable, "stable", "0.1.0", session=FakeSession(stable_assets))
+    assert progress[-2:] == [
+        {"phase": "downloading", "downloaded_bytes": stable.artifact.size,
+         "total_bytes": stable.artifact.size}, {"phase": "verifying"},
+    ]
+    candidate = Path(staged["candidate_path"])
+    assert candidate.is_dir()
+    marker, expected_files = load_verified_candidate(
+        str(candidate), stable.version, staged["manifest_sha256"]
+    )
+    assert marker["version"] == "0.2.0"
+    assert "package.json" in expected_files
+    assert not any(path.suffix in {".db", ".log"} for path in candidate.rglob("*"))
+
+    original_package = (candidate / "package.json").read_bytes()
+    (candidate / "package.json").write_bytes(original_package + b" ")
+    assert_error(
+        "update_archive_manifest_mismatch",
+        lambda: validate_candidate(
+            str(candidate), stable.version, staged["manifest_sha256"]
+        ),
+    )
+    shutil.rmtree(candidate.parent)
+
+    wrong_signature = dict(stable_assets)
+    wrong_signature[stable.signature.api_url] = FakeResponse(base64.b64encode(b"x" * 64))
+    assert_error(
+        "update_signature_invalid",
+        lambda: stage_release(
+            stable, "stable", "0.1.0", session=FakeSession(wrong_signature)
+        ),
+    )
+
+    malicious_release, malicious_assets, _, _, _ = build_bundle(
+        "0.2.1", manifest_path_override="../package.json"
+    )
+    assert_error(
+        "update_archive_path_invalid",
+        lambda: stage_release(
+            malicious_release,
+            "stable",
+            "0.1.0",
+            session=FakeSession(malicious_assets),
+        ),
+    )
+
+    symlink = tarfile.TarInfo("frontend/link")
+    symlink.type = tarfile.SYMTYPE
+    symlink.linkname = "/etc/passwd"
+    symlink.size = 0
+    linked_release, linked_assets, _, _, _ = build_bundle("0.2.2", extra_member=symlink)
+    assert_error(
+        "update_archive_link_rejected",
+        lambda: stage_release(
+            linked_release,
+            "stable",
+            "0.1.0",
+            session=FakeSession(linked_assets),
+        ),
+    )
+
+    hardlink = tarfile.TarInfo("frontend/hard-link")
+    hardlink.type = tarfile.LNKTYPE
+    hardlink.linkname = "frontend/index.html"
+    hardlink.size = 0
+    hardlink_release, hardlink_assets, _, _, _ = build_bundle("0.2.3", extra_member=hardlink)
+    assert_error(
+        "update_archive_link_rejected",
+        lambda: stage_release(
+            hardlink_release,
+            "stable",
+            "0.1.0",
+            session=FakeSession(hardlink_assets),
+        ),
+    )
+
+    device = tarfile.TarInfo("frontend/device-node")
+    device.type = tarfile.CHRTYPE
+    device.devmajor = 1
+    device.devminor = 3
+    device.size = 0
+    device_release, device_assets, _, _, _ = build_bundle("0.2.4", extra_member=device)
+    assert_error(
+        "update_archive_type_rejected",
+        lambda: stage_release(
+            device_release,
+            "stable",
+            "0.1.0",
+            session=FakeSession(device_assets),
+        ),
+    )
+
+    duplicate_payload = candidate_files("0.2.5")["package.json"][0]
+    duplicate = tarfile.TarInfo("package.json")
+    duplicate.size = len(duplicate_payload)
+    duplicate_release, duplicate_assets, _, _, _ = build_bundle(
+        "0.2.5", extra_member=(duplicate, duplicate_payload)
+    )
+    assert_error(
+        "update_archive_duplicate",
+        lambda: stage_release(
+            duplicate_release,
+            "stable",
+            "0.1.0",
+            session=FakeSession(duplicate_assets),
+        ),
+    )
+
+    runtime_release, runtime_assets, _, _, _ = build_bundle(
+        "0.2.6", manifest_path_override="data/saas.db"
+    )
+    assert_error(
+        "update_runtime_path_rejected",
+        lambda: stage_release(
+            runtime_release,
+            "stable",
+            "0.1.0",
+            session=FakeSession(runtime_assets),
+        ),
+    )
+    absolute_release, absolute_assets, _, _, _ = build_bundle(
+        "0.2.7", manifest_path_override="/package.json"
+    )
+    assert_error(
+        "update_archive_path_invalid",
+        lambda: stage_release(
+            absolute_release,
+            "stable",
+            "0.1.0",
+            session=FakeSession(absolute_assets),
+        ),
+    )
+
+    checksum_release, checksum_assets, _, _, checksum_archive = build_bundle("0.2.8")
+    tampered_archive = bytearray(checksum_archive)
+    tampered_archive[-1] ^= 1
+    checksum_assets[checksum_release.artifact.api_url] = FakeResponse(bytes(tampered_archive))
+    assert_error(
+        "update_artifact_hash_mismatch",
+        lambda: stage_release(
+            checksum_release,
+            "stable",
+            "0.1.0",
+            session=FakeSession(checksum_assets),
+        ),
+    )
+
+    dependency_release, dependency_assets, _, _, _ = build_bundle(
+        "0.2.3", dependency="9.9.9"
+    )
+    assert_error(
+        "update_dependency_change_rejected",
+        lambda: stage_release(
+            dependency_release,
+            "stable",
+            "0.1.0",
+            session=FakeSession(dependency_assets),
+        ),
+    )
+    assert_error(
+        "update_downgrade_rejected",
+        lambda: stage_release(
+            stable, "stable", "0.2.0", session=FakeSession(stable_assets)
+        ),
+    )
+
+    maintenance_stage = stage_release(
+        stable, "stable", "0.1.0", session=FakeSession(stable_assets), require_maintenance=True,
+    )
+    validate_candidate(
+        maintenance_stage["candidate_path"], stable.version,
+        maintenance_stage["manifest_sha256"], require_maintenance=True,
+    )
+    shutil.rmtree(Path(maintenance_stage["candidate_path"]).parent)
+    invalid_maintenance_sources = (
+        False,
+        b"",
+        b"MAINTENANCE_PROTOCOL = 2\n",
+        b"MAINTENANCE_PROTOCOL = int('1')\n",
+        b"MAINTENANCE_PROTOCOL = 1\nimport math as MAINTENANCE_PROTOCOL\n",
+    )
+    for offset, maintenance_source in enumerate(invalid_maintenance_sources, 1):
+        release, assets, _, _, _ = build_bundle(
+            f"0.4.{offset}", maintenance=maintenance_source,
+        )
+        before = {path.name for path in STAGING_ROOT.iterdir()}
+        assert_error(
+            "update_maintenance_protocol_unsupported",
+            lambda release=release, assets=assets: stage_release(
+                release, "stable", "0.1.0", session=FakeSession(assets), require_maintenance=True,
+            ),
+        )
+        assert {path.name for path in STAGING_ROOT.iterdir()} == before
+
+    portable_releases = RUN_DIR / "portable-rollback-releases"
+    trusted_rollback = portable_releases / "0.4.7"
+    install_signed_release(trusted_rollback, "0.4.7")
+    install_signed_release(
+        portable_releases / "0.4.6",
+        "0.4.6",
+        maintenance=b"MAINTENANCE_PROTOCOL = 1\nimport math as MAINTENANCE_PROTOCOL\n",
+    )
+    install_signed_release(portable_releases / "0.4.5", "0.4.5", maintenance=False)
+    tampered_rollback = portable_releases / "0.4.4"
+    install_signed_release(tampered_rollback, "0.4.4")
+    (tampered_rollback / "backend/update_maintenance.py").write_bytes(
+        b"MAINTENANCE_PROTOCOL = 1\n# changed after signing\n"
+    )
+    with patch.dict(os.environ, {"SAAS_RELEASES_DIR": str(portable_releases)}, clear=False), \
+         patch("platform_update.deployment_kind", return_value="systemd"), \
+         trusted_rollback_fixture(portable_releases):
+        rollback_candidates = available_rollback_versions("0.5.0")
+    assert rollback_candidates == [{
+        "version": "0.4.7",
+        "manifest_sha256": hashlib.sha256((trusted_rollback / CACHED_MANIFEST_FILE).read_bytes()).hexdigest(),
+    }]
+
+    standalone_releases = RUN_DIR / "standalone-rollback-releases"
+    standalone_current = standalone_releases / "0.5.0"
+    standalone_rollback = standalone_releases / "0.4.9"
+    install_signed_standalone_release(standalone_current, "0.5.0")
+    install_signed_standalone_release(standalone_rollback, "0.4.9")
+    install_signed_standalone_release(standalone_releases / "0.4.8", "0.4.8", update_data_version=2)
+    install_signed_standalone_release(standalone_releases / "0.4.7", "0.4.7", manager_protocol=2)
+    with patch.dict(os.environ, {
+        "SAAS_RELEASES_DIR": str(standalone_releases),
+        "SAAS_CURRENT_ROOT": str(standalone_current),
+        "SAAS_RELEASE_KIND": "standalone",
+    }, clear=False), patch("platform_update.deployment_kind", return_value="systemd"), \
+         patch.object(PLATFORM_UPDATE, "MAX_MANIFEST_BYTES", 64), \
+         trusted_rollback_fixture(standalone_releases):
+        standalone_candidates = available_rollback_versions("0.5.0")
+    assert standalone_candidates == [{
+        "version": "0.4.9",
+        "manifest_sha256": hashlib.sha256(
+            (standalone_rollback / CACHED_MANIFEST_FILE).read_bytes()
+        ).hexdigest(),
+    }]
+
+    if "--portable" in sys.argv:
+        print("platform update portable staging: ok; POSIX intent, ownership and executor checks not run")
+        return
+
+    clean_staged = stage_release(
+        stable, "stable", "0.1.0", session=FakeSession(stable_assets)
+    )
+    intent_result = write_update_intent(
+        "apply",
+        stable.version,
+        channel="stable",
+        requested_by=1,
+        candidate_path=clean_staged["candidate_path"],
+        manifest_sha256=clean_staged["manifest_sha256"],
+    )
+    assert intent_result == {"queued": True, "action": "apply", "version": "0.2.0"}
+    assert INTENT_FILE.stat().st_mode & 0o077 == 0
+    assert_error(
+        "update_intent_pending",
+        lambda: write_update_intent(
+            "apply",
+            stable.version,
+            channel="stable",
+            requested_by=1,
+            candidate_path=clean_staged["candidate_path"],
+            manifest_sha256=clean_staged["manifest_sha256"],
+        ),
+    )
+    INTENT_FILE.unlink()
+
+    updater = load_updater_module()
+    install_root = RUN_DIR / "install"
+    releases = install_root / "releases"
+    old_release = releases / "0.1.0"
+    install_signed_release(old_release, "0.1.0")
+    current = install_root / "current"
+    current.symlink_to(old_release)
+    state = RUN_DIR / "runtime-state"
+    state.mkdir()
+    database_path = state / "saas.db"
+    database = DB(str(database_path))
+    database.create_user("update-owner", "Update-Contract-123!", role="admin")
+    runtime_sentinel = state / "tenant-runtime-sentinel"
+    runtime_sentinel.write_text("must survive", encoding="utf-8")
+    config = updater.Config(
+        releases_dir=releases,
+        current_link=current,
+        staging_dir=STAGING_ROOT,
+        state_dir=state,
+        database_path=database_path,
+        intent_file=state / "update-intents" / "intent.json",
+        lock_file=state / "updater.lock",
+        backup_dir=state / "backups",
+        api_service="xianyu-intelligent-cs.service",
+        consumer_service="xianyu-intelligent-cs-consumer.service",
+        health_base_url="http://127.0.0.1:8096/",
+        public_base_url="http://127.0.0.1/xianyu-intelligent-cs/",
+    )
+    updater.validate_layout(config)
+    lock_descriptor = updater.acquire_lock(config)
+    try:
+        try:
+            updater.acquire_lock(config)
+        except updater.UpdaterError as exc:
+            assert exc.code == "update_already_running"
+        else:
+            raise AssertionError("updater lock must reject concurrent execution")
+    finally:
+        os.close(lock_descriptor)
+
+    # A second updater must not delete the first process's claimed intent when
+    # it exits after failing to acquire the lock.
+    processing_path = config.intent_file.with_name("intent.processing.json")
+    processing_path.parent.mkdir(parents=True, exist_ok=True)
+    processing_path.write_text("{}", encoding="utf-8")
+    with patch.object(updater.Config, "from_env", return_value=config), patch.object(
+        updater, "acquire_lock", side_effect=updater.UpdaterError("update_already_running")
+    ):
+        assert updater.main() == 1
+    assert processing_path.exists(), "a concurrent updater must preserve the claimed intent"
+    processing_path.unlink()
+
+    os.environ["SAAS_GITHUB_READ_TOKEN"] = "must-not-reach-updater-child"
+    captured_child = {}
+
+    def capture_child(_command, **kwargs):
+        captured_child.update(kwargs.get("env") or {})
+        return SimpleNamespace(returncode=0)
+
+    with patch.object(updater.subprocess, "run", side_effect=capture_child):
+        updater.SystemRunner().run(["systemctl", "is-active", "xianyu-intelligent-cs.service"])
+    assert "SAAS_GITHUB_READ_TOKEN" not in captured_child
+    assert captured_child["PYTHONDONTWRITEBYTECODE"] == "1"
+    captured_migration = {}
+
+    def capture_migration(_command, **kwargs):
+        captured_migration.update(kwargs.get("env") or {})
+        return SimpleNamespace(returncode=0)
+
+    with patch.object(updater.subprocess, "run", side_effect=capture_migration):
+        updater.run_migrations(old_release, config, updater.SystemRunner())
+    assert captured_migration["SAAS_DB"] == str(database_path)
+    assert "SAAS_GITHUB_READ_TOKEN" not in captured_migration
+    os.environ.pop("SAAS_GITHUB_READ_TOKEN", None)
+
+    stale_apply = updater.Intent(
+        action="apply",
+        version="0.0.9",
+        channel="stable",
+        candidate_path="",
+        manifest_sha256="",
+        requested_by=1,
+        nonce="d" * 32,
+    )
+    try:
+        updater.process_intent(
+            config,
+            stale_apply,
+            runner=object(),
+            health_client=object(),
+            database=database,
+        )
+    except updater.UpdaterError as exc:
+        assert exc.code == "update_downgrade_rejected"
+    else:
+        raise AssertionError("updater must independently reject stale apply intents")
+
+    forward_rollback = updater.Intent(
+        action="rollback",
+        version="0.2.0",
+        channel="stable",
+        candidate_path="",
+        manifest_sha256="",
+        requested_by=1,
+        nonce="e" * 32,
+    )
+    try:
+        updater.process_intent(
+            config,
+            forward_rollback,
+            runner=object(),
+            health_client=object(),
+            database=database,
+        )
+    except updater.UpdaterError as exc:
+        assert exc.code == "update_rollback_target_invalid"
+    else:
+        raise AssertionError("rollback must target an older signed release")
+
+    update_intent = updater.Intent(
+        action="apply",
+        version="0.2.0",
+        channel="stable",
+        candidate_path=clean_staged["candidate_path"],
+        manifest_sha256=clean_staged["manifest_sha256"],
+        requested_by=1,
+        nonce="a" * 32,
+    )
+    materialized = updater.materialize_release(config, update_intent)
+    assert materialized == releases / "0.2.0"
+    updater.verify_existing_release(config, "0.2.0")
+    with patch("platform_update.deployment_kind", return_value="systemd"), trusted_rollback_fixture(releases):
+        assert available_rollback_versions("0.1.0") == [], "newer releases are not rollback targets"
+    updater.switch_current(config, materialized)
+    assert updater.current_release(config) == materialized.resolve()
+    install_signed_release(releases / "0.0.6", "0.0.6", maintenance=False)
+    with patch("platform_update.deployment_kind", return_value="systemd"), trusted_rollback_fixture(releases):
+        rollback_candidates = available_rollback_versions("0.2.0")
+    assert not any(x["version"] == "0.0.6" for x in rollback_candidates), "signed pre-maintenance code is not an automatic rollback baseline"
+    assert rollback_candidates == [{"version": "0.1.0", "manifest_sha256": hashlib.sha256((old_release / CACHED_MANIFEST_FILE).read_bytes()).hexdigest()}]
+    updater.switch_current(config, old_release)
+
+    class FakeRunner:
+        def __init__(self):
+            self.commands = []
+
+        def run(self, command, **_kwargs):
+            self.commands.append(command)
+
+    runner = FakeRunner()
+    failing_intent = updater.Intent(
+        action="apply",
+        version="0.2.0",
+        channel="stable",
+        candidate_path=clean_staged["candidate_path"],
+        manifest_sha256=clean_staged["manifest_sha256"],
+        requested_by=1,
+        nonce="b" * 32,
+    )
+    health_versions = []
+
+    def fail_new_health(_config, version, _client):
+        health_versions.append(version)
+        if version == "0.2.0":
+            raise updater.UpdaterError("update_health_failed")
+
+    with (
+        patch.object(updater, "materialize_release", return_value=materialized),
+        patch.object(updater, "run_migrations", return_value=None),
+        patch.object(updater, "check_health", side_effect=fail_new_health),
+    ):
+        try:
+            updater.process_intent(
+                config,
+                failing_intent,
+                runner=runner,
+                health_client=object(),
+                database=database,
+            )
+        except updater.UpdaterError as exc:
+            assert exc.code == "update_health_failed"
+        else:
+            raise AssertionError("health failure must trigger rollback")
+    assert updater.current_release(config) == old_release.resolve()
+    assert health_versions == ["0.2.0", "0.1.0"]
+    assert runtime_sentinel.read_text(encoding="utf-8") == "must survive"
+    assert database.get_user("update-owner") is not None
+    latest = database.get_platform_update("0.2.0", "stable")
+    assert latest["status"] == "rolled_back"
+    assert latest["error_code"] == "update_health_failed"
+    existing_backups = list(config.backup_dir.glob("*.db"))
+    assert existing_backups
+    worker_intents = updater.snapshot_worker_intents(database_path)
+    first_backup = updater.backup_database(config, "0.2.1", worker_intents)
+    second_backup = updater.backup_database(config, "0.2.2", worker_intents)
+    assert first_backup != second_backup
+    assert first_backup.stat().st_mode & 0o077 == 0
+    assert second_backup.stat().st_mode & 0o077 == 0
+    assert not materialized.exists()
+
+    for index, version in enumerate(("0.0.7", "0.0.8", "0.0.9"), start=1):
+        release_dir = releases / version
+        install_signed_release(release_dir, version)
+        os.utime(release_dir, (1000 + index, 1000 + index))
+    foreign = releases / "9.9.9"
+    foreign.mkdir()
+    (foreign / "operator-owned.txt").write_text("must survive", encoding="utf-8")
+    os.utime(releases / "0.0.6", (800, 800))
+    os.utime(old_release, (900, 900))
+    updater.prune_releases(config)
+    retained = {
+        path.name for path in releases.iterdir()
+        if path.is_dir() and not path.is_symlink() and not path.name.startswith(".")
+    }
+    assert retained == {"0.1.0", "0.0.8", "0.0.9", "9.9.9"}
+    assert (foreign / "operator-owned.txt").read_text(encoding="utf-8") == "must survive"
+    assert "0.1.0" in retained, "the active release must be retained within the verified three-version cap"
+    print("platform update contract: ok")
+
+
+if __name__ == "__main__":
+    if "--portable" in sys.argv and os.name != "posix":
+        # Explicitly inject only the pre-provisioned key boundary. Signatures
+        # and archive validation remain real; do not fake POSIX file ownership.
+        with patch("platform_update.load_public_key", return_value=PRIVATE_KEY.public_key()):
+            main()
+    else:
+        main()

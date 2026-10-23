@@ -1,0 +1,7 @@
+Project: xianyu-intelligent-cs
+Upstream: https://github.com/tswawa/xianyu-saas
+Initial customized source: 6701c62f3a96b1648a9fefde429f3fe3ef6386a9
+Initial branch: codex/excel-knowledge-handoff
+Imported: 2026-10-22 Asia/Shanghai
+Current version: git rev-parse HEAD
+Offline archive excludes Git history and runtime credentials.

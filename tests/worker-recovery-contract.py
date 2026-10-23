@@ -1,0 +1,953 @@
+#!/usr/bin/env python3
+"""Offline contracts for restart-safe worker PID adoption."""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "backend"))
+
+import bot_manager  # noqa: E402
+
+
+def _isolated_bot_config(**overrides: str) -> dict:
+    env = dict(os.environ)
+    for name in ("SAAS_BOT_ROOT", "SAAS_BOT_PYTHON", "SAAS_BOT_PYTHONPATH"):
+        env.pop(name, None)
+    env.update(overrides)
+    source = (
+        "import json, sys; "
+        f"sys.path.insert(0, {str(ROOT / 'backend')!r}); "
+        "import bot_manager; "
+        "print(json.dumps({"
+        "'root': str(bot_manager.BOT_ROOT), "
+        "'python': bot_manager.BOT_PYTHON, "
+        "'pythonpath': bot_manager.BOT_PYTHONPATH"
+        "}))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        cwd=str(ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def _test_worker_runtime_configuration() -> None:
+    user_id = 77
+
+    # Without the standalone overrides, the Docker/development layout keeps
+    # using the worker-local virtualenv interpreter exactly as before.
+    fallback_root = (ROOT / "worker").resolve()
+    fallback = _isolated_bot_config(SAAS_BOT_ROOT=str(fallback_root))
+    assert fallback == {
+        "root": str(fallback_root),
+        "python": str(fallback_root / ".venv/bin/python"),
+        "pythonpath": None,
+    }, fallback
+
+    # A standalone release can share its versioned interpreter while keeping
+    # the existing argv, cwd and PID identity contract. Its dependency tree is
+    # explicitly isolated from the API process' inherited PYTHONPATH.
+    current_root = Path("/") / "opt" / "xianyu-intelligent-cs" / "current"
+    explicit_python = str(current_root / "runtime/python/bin/python3")
+    worker_pythonpath = str(current_root / "runtime/site/worker")
+    explicit = _isolated_bot_config(
+        SAAS_BOT_ROOT=str(current_root / "worker"),
+        SAAS_BOT_PYTHON=explicit_python,
+        SAAS_BOT_PYTHONPATH=worker_pythonpath,
+    )
+    assert explicit["python"] == explicit_python
+    assert explicit["pythonpath"] == worker_pythonpath
+
+    with tempfile.TemporaryDirectory(prefix="xianyu-worker-runtime-") as root:
+        tenants_root = Path(root) / "tenants"
+        worker_root = Path(root) / "worker"
+        worker_root.mkdir()
+        with patch.object(bot_manager, "TENANTS_ROOT", str(tenants_root)):
+            bot_manager.ensure_dir(user_id, initialize=True)
+            with (
+                patch.object(bot_manager, "BOT_PYTHONPATH", None),
+                patch.dict(os.environ, {"PYTHONPATH": "api-parent-path"}, clear=False),
+            ):
+                assert bot_manager._env_for(user_id)["PYTHONPATH"] == "api-parent-path"
+
+            fake_process = Mock(pid=49001)
+            with (
+                patch.object(bot_manager, "BOT_ROOT", worker_root),
+                patch.object(bot_manager, "BOT_MAIN", str(worker_root / "main.py")),
+                patch.object(bot_manager, "BOT_PYTHON", explicit_python),
+                patch.object(bot_manager, "BOT_PYTHONPATH", worker_pythonpath),
+                patch.dict(os.environ, {"PYTHONPATH": "api-parent-path"}, clear=False),
+                patch.object(bot_manager, "_revoke"),
+                patch.object(bot_manager, "_limit", return_value=None),
+                patch.object(bot_manager.subprocess, "Popen", return_value=fake_process) as spawn,
+            ):
+                process, token, log_file = bot_manager._spawn_process(
+                    user_id,
+                    "rules",
+                    (user_id, "default"),
+                    {"worker_memory_mib": 400},
+                )
+            try:
+                assert process is fake_process
+                assert token is None
+                argv = spawn.call_args.args[0]
+                options = spawn.call_args.kwargs
+                assert argv == [explicit_python, str(worker_root / "main.py")]
+                assert options["cwd"] == str(worker_root)
+                assert options["start_new_session"] is True
+                assert options["env"]["PYTHONPATH"] == worker_pythonpath
+            finally:
+                log_file.close()
+
+
+def _test_legacy_worker_runtime_migration() -> None:
+    from db import DB
+
+    with tempfile.TemporaryDirectory(prefix="xianyu-worker-migration-") as root:
+        path = Path(root) / "legacy.db"
+        legacy = sqlite3.connect(path)
+        legacy.row_factory = sqlite3.Row
+        try:
+            # Frozen v0.4.5 worker_runtimes schema: no auto_resume column.
+            legacy.execute(
+                """
+                CREATE TABLE worker_runtimes (
+                    user_id INTEGER NOT NULL,
+                    account_id INTEGER NOT NULL,
+                    desired_state TEXT NOT NULL DEFAULT 'stopped',
+                    mode TEXT NOT NULL DEFAULT 'rules',
+                    state TEXT NOT NULL DEFAULT 'stopped',
+                    pid INTEGER,
+                    generation INTEGER NOT NULL DEFAULT 0,
+                    started_at REAL,
+                    heartbeat_at REAL,
+                    exit_code INTEGER,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(user_id, account_id)
+                )
+                """
+            )
+            cases = (
+                (1, "stopped", "stopped", None, 0),
+                (2, "running", "running", 42002, 1),
+                (3, "running", "error", None, 1),
+                (4, "stopped", "error", None, 1),
+                (5, "running", "stopped", None, 1),
+                (6, "stopped", "stopped", 42006, 1),
+                (7, "stopped", "degraded", None, 1),
+            )
+            for account_id, desired, state, pid, _expected in cases:
+                legacy.execute(
+                    """
+                    INSERT INTO worker_runtimes(
+                        user_id, account_id, desired_state, mode, state, pid,
+                        generation, started_at, heartbeat_at, exit_code, last_error, updated_at
+                    ) VALUES (77, ?, ?, 'rules_ai', ?, ?, 4, 100, 200, 0, 'legacy-record', 300)
+                    """,
+                    (account_id, desired, state, pid),
+                )
+            legacy.commit()
+            before = {
+                int(row["account_id"]): dict(row)
+                for row in legacy.execute("SELECT * FROM worker_runtimes")
+            }
+        finally:
+            legacy.close()
+
+        migrated = DB(str(path))
+        try:
+            for account_id, _desired, _state, _pid, expected in cases:
+                row = dict(migrated.get_worker_runtime(77, account_id))
+                assert row.pop("auto_resume") == expected, (account_id, row)
+                assert row == before[account_id], (account_id, row, before[account_id])
+            # A later explicit start/stop must survive subsequent initialization.
+            assert migrated.set_worker_auto_resume(77, 1, True)
+            assert migrated.set_worker_auto_resume(77, 2, False)
+            after = [dict(row) for row in migrated.list_worker_runtimes()]
+        finally:
+            migrated.con.close()
+
+        reopened = DB(str(path))
+        try:
+            assert [dict(row) for row in reopened.list_worker_runtimes()] == after
+            # Records created after the migration keep the default-on contract.
+            reopened.con.execute(
+                "INSERT INTO worker_runtimes(user_id, account_id, updated_at) VALUES (77, 8, 400)"
+            )
+            assert reopened.get_worker_runtime(77, 8)["auto_resume"] == 1
+        finally:
+            reopened.con.close()
+
+        fresh = DB(str(Path(root) / "fresh.db"))
+        try:
+            fresh.con.execute(
+                "INSERT INTO worker_runtimes(user_id, account_id, updated_at) VALUES (77, 1, 400)"
+            )
+            fresh.con.commit()
+            fresh._init()
+            assert fresh.get_worker_runtime(77, 1)["auto_resume"] == 1
+        finally:
+            fresh.con.close()
+
+    print("worker-runtime migration: legacy stops preserved, other state unchanged, defaults and reinitialization passed")
+
+
+def main() -> None:
+    user_id = 77
+    _test_legacy_worker_runtime_migration()
+    _test_worker_runtime_configuration()
+
+    # A verified deterministic worker can be attached without spawning a
+    # second process.  The adopted handle participates in normal status code.
+    with (
+        patch.object(bot_manager, "_pid_alive", return_value=True),
+        patch.object(bot_manager, "_expected_worker_pid", return_value=True),
+        patch.object(bot_manager, "_proc_start_time", return_value="100"),
+        patch.object(bot_manager.os, "pidfd_open", return_value=70),
+    ):
+        assert bot_manager.adopt(user_id, 45123, "rules") == (True, "adopted")
+        assert bot_manager.is_running(user_id) is True
+        assert bot_manager.process_id(user_id) == 45123
+        assert bot_manager.status(user_id)["running"] is True
+
+    # An adopted handle retains the Linux process start-time identity.  If the
+    # PID is later reused, poll treats the old worker as dead and stop must not
+    # signal the unrelated replacement process.
+    reused_user = 79
+    with (
+        patch.object(bot_manager, "_pid_alive", return_value=True),
+        patch.object(bot_manager, "_expected_worker_pid", return_value=True),
+        patch.object(bot_manager, "_proc_start_time", side_effect=("200", "200")),
+        patch.object(bot_manager.os, "pidfd_open", return_value=71),
+    ):
+        assert bot_manager.adopt(reused_user, 45127, "rules") == (True, "adopted")
+    with (
+        patch.object(bot_manager, "_pid_alive", return_value=True),
+        patch.object(bot_manager, "_proc_start_time", return_value="201"),
+        patch.object(bot_manager.os, "killpg") as reused_killpg,
+    ):
+        assert bot_manager.is_running(reused_user) is False
+        assert bot_manager.stop(reused_user) == (False, "not_running")
+    reused_killpg.assert_not_called()
+
+    # Adopted workers use pidfd_send_signal when available, binding the signal
+    # to the original task rather than the reusable numeric PID.
+    pidfd_user = 82
+    pidfd_key = (pidfd_user, "default")
+    pidfd_proc = bot_manager._AdoptedProcess(45129, "300", 77)
+    with bot_manager._lock:
+        bot_manager._procs[pidfd_key] = pidfd_proc
+        bot_manager._modes[pidfd_key] = "rules"
+        bot_manager._desired_running[pidfd_key] = True
+        bot_manager._generations[pidfd_key] = 1
+
+    def finish_pidfd_wait(timeout=None):
+        del timeout
+        pidfd_proc.returncode = 0
+        return 0
+
+    with (
+        patch.object(bot_manager, "_pid_alive", return_value=True),
+        patch.object(bot_manager, "_proc_start_time", return_value="300"),
+        patch.object(pidfd_proc, "wait", side_effect=finish_pidfd_wait),
+        patch.object(bot_manager.signal, "pidfd_send_signal") as pidfd_signal,
+        patch.object(bot_manager.os, "killpg") as pidfd_killpg,
+        patch.object(bot_manager.os, "close"),
+        patch.object(bot_manager, "revoke_token"),
+    ):
+        assert bot_manager.stop(pidfd_user) == (True, "stopped")
+    pidfd_signal.assert_called_once_with(77, bot_manager.signal.SIGTERM, None, 0)
+    pidfd_killpg.assert_not_called()
+
+    # Without pidfd, an adopted worker is deliberately not signalled: checking
+    # start-time and then killpg would retain an unavoidable PID-reuse TOCTOU.
+    fallback_user = 83
+    fallback_key = (fallback_user, "default")
+    fallback_proc = bot_manager._AdoptedProcess(45130, "400", None)
+    with bot_manager._lock:
+        bot_manager._procs[fallback_key] = fallback_proc
+        bot_manager._modes[fallback_key] = "rules"
+        bot_manager._desired_running[fallback_key] = True
+        bot_manager._generations[fallback_key] = 1
+    with (
+        patch.object(bot_manager, "_pid_alive", return_value=True),
+        patch.object(bot_manager, "_proc_start_time", return_value="400"),
+        patch.object(bot_manager.os, "killpg") as fallback_killpg,
+        patch.object(bot_manager, "revoke_token"),
+    ):
+        assert bot_manager.stop(fallback_user) == (False, "stop_failed")
+        assert fallback_key in bot_manager._transitions
+    fallback_killpg.assert_not_called()
+    fallback_proc.returncode = 0
+    with patch.object(bot_manager, "revoke_token"):
+        assert bot_manager.stop(fallback_user) == (True, "already_dead")
+
+    # A member worker cannot be adopted because its loopback token was held by
+    # the previous API process.  It must be replaced with a fresh process.
+    with (
+        patch.object(bot_manager, "_pid_alive", return_value=True),
+        patch.object(bot_manager, "_expected_worker_pid", return_value=True),
+    ):
+        assert bot_manager.adopt(user_id, 45123, "rules_ai") == (False, "token_unavailable")
+
+    # A PID that is alive but no longer identifies our worker is never
+    # shadowed or signalled automatically.
+    bot_manager._procs[(user_id, "default")].returncode = 0
+    bot_manager.stop(user_id)
+    with (
+        patch.object(bot_manager, "_pid_alive", return_value=True),
+        patch.object(bot_manager, "_expected_worker_pid", return_value=False),
+    ):
+        assert bot_manager.adopt(user_id, 45124, "rules") == (False, "pid_mismatch")
+        assert bot_manager.terminate_pid(user_id, 45124) == (False, "pid_mismatch")
+
+    # A container may reuse the old worker's numeric PID for this very API.
+    # This is positive identity evidence, not permission to signal the process.
+    with (
+        patch.object(bot_manager.os, "getpid", return_value=45141),
+        patch.object(bot_manager.os, "kill") as own_kill,
+        patch.object(bot_manager.os, "killpg") as own_killpg,
+        patch.object(bot_manager.os, "pidfd_open") as own_pidfd,
+        patch.object(bot_manager, "_expected_worker_pid") as own_identity,
+    ):
+        assert bot_manager.adopt(user_id, 45141, "rules") == (False, "pid_reused")
+        assert bot_manager.adopt(user_id, 45141, "rules_ai") == (False, "pid_reused")
+        assert bot_manager.terminate_pid(user_id, 45141) == (False, "pid_reused")
+    own_kill.assert_not_called()
+    own_killpg.assert_not_called()
+    own_pidfd.assert_not_called()
+    own_identity.assert_not_called()
+
+    # Linux can reuse a dead worker PID for a non-leader API thread. Such TIDs
+    # have a readable /proc/<tid> but are absent from /proc directory listings.
+    if sys.platform.startswith("linux"):
+        thread_ready = threading.Event()
+        thread_done = threading.Event()
+        native_ids = []
+
+        def hold_api_thread():
+            native_ids.append(threading.get_native_id())
+            thread_ready.set()
+            thread_done.wait(10)
+
+        api_thread = threading.Thread(target=hold_api_thread)
+        api_thread.start()
+        try:
+            assert thread_ready.wait(5)
+            tid = native_ids[0]
+            assert tid != os.getpid()
+            assert bot_manager._proc_tgid(tid) == os.getpid()
+            with (
+                patch.object(bot_manager.os, "kill") as thread_kill,
+                patch.object(bot_manager.os, "killpg") as thread_killpg,
+                patch.object(bot_manager.os, "pidfd_open") as thread_pidfd,
+                patch.object(bot_manager, "_expected_worker_pid") as thread_identity,
+            ):
+                assert bot_manager.adopt(user_id, tid, "rules") == (False, "pid_reused")
+                assert bot_manager.adopt(user_id, tid, "rules_ai") == (False, "pid_reused")
+                assert bot_manager.terminate_pid(user_id, tid) == (False, "pid_reused")
+            thread_kill.assert_not_called()
+            thread_killpg.assert_not_called()
+            thread_pidfd.assert_not_called()
+            thread_identity.assert_not_called()
+        finally:
+            thread_done.set()
+            api_thread.join(5)
+
+    # An unreadable identity for any other live PID still fails closed.
+    with (
+        patch.object(bot_manager.os, "getpid", return_value=45141),
+        patch.object(bot_manager, "_proc_tgid", return_value=None),
+        patch.object(bot_manager, "_pid_alive", return_value=True),
+        patch.object(bot_manager, "_proc_cmdline", return_value=[]),
+        patch.object(bot_manager.os, "pidfd_open") as unreadable_pidfd,
+    ):
+        assert bot_manager.adopt(user_id, 45142, "rules") == (False, "pid_mismatch")
+        assert bot_manager.terminate_pid(user_id, 45142) == (False, "pid_mismatch")
+    unreadable_pidfd.assert_not_called()
+
+    # A verified orphan is bound to a pidfd before signalling.  No numeric PID
+    # kill fallback is allowed after a separated identity check.
+    def finish_orphan_wait(proc, timeout=None):
+        del timeout
+        proc.returncode = 0
+        return 0
+
+    with (
+        patch.object(bot_manager, "_expected_worker_pid", return_value=True),
+        patch.object(bot_manager, "_pid_alive", return_value=True),
+        patch.object(bot_manager, "_proc_start_time", return_value="101"),
+        patch.object(bot_manager.os, "pidfd_open", return_value=88),
+        patch.object(bot_manager.signal, "pidfd_send_signal") as orphan_pidfd_signal,
+        patch.object(bot_manager._AdoptedProcess, "wait", finish_orphan_wait),
+        patch.object(bot_manager.os, "killpg") as orphan_killpg,
+        patch.object(bot_manager.os, "close"),
+    ):
+        assert bot_manager.terminate_pid(user_id, 45125) == (True, "stopped")
+    orphan_pidfd_signal.assert_called_once_with(88, bot_manager.signal.SIGTERM, None, 0)
+    orphan_killpg.assert_not_called()
+
+    with (
+        patch.object(bot_manager, "_expected_worker_pid", return_value=True),
+        patch.object(bot_manager, "_pid_alive", return_value=True),
+        patch.object(bot_manager, "_proc_start_time", return_value="102"),
+        patch.object(bot_manager.os, "pidfd_open", side_effect=OSError("unsupported")),
+        patch.object(bot_manager.os, "killpg") as unavailable_killpg,
+    ):
+        assert bot_manager.terminate_pid(user_id, 45126) == (False, "pidfd_unavailable")
+    unavailable_killpg.assert_not_called()
+
+    # A second timeout after SIGKILL is a failed stop, not proof of death.  The
+    # reservation remains visible and blocks start until a later poll confirms
+    # that the exact process has exited.
+    class StubbornProcess:
+        pid = 45128
+
+        def __init__(self):
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            raise bot_manager.subprocess.TimeoutExpired(["worker"], timeout)
+
+    stubborn_user = 80
+    stubborn_key = (stubborn_user, "default")
+    stubborn_proc = StubbornProcess()
+    with bot_manager._lock:
+        bot_manager._procs[stubborn_key] = stubborn_proc
+        bot_manager._modes[stubborn_key] = "rules_ai"
+        bot_manager._desired_running[stubborn_key] = True
+        bot_manager._generations[stubborn_key] = 1
+    with (
+        patch.object(bot_manager.os, "getpgid", return_value=stubborn_proc.pid),
+        patch.object(bot_manager.os, "killpg"),
+        patch.object(bot_manager, "revoke_token"),
+    ):
+        assert bot_manager.stop(stubborn_user) == (False, "stop_timeout")
+        assert stubborn_key in bot_manager._transitions
+        assert bot_manager.start(stubborn_user, "rules") == (False, "transition_in_progress")
+        stubborn_proc.returncode = 0
+        assert bot_manager.stop(stubborn_user) == (True, "already_dead")
+    assert stubborn_key not in bot_manager._transitions
+
+    # Legacy subscription expiry is compatibility data only. Reconciliation
+    # must not stop, replace, downgrade, revoke, reserve, or persist an AI worker.
+    class FakeWatchdogProcess:
+        pid = 45126
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return self.returncode
+
+    watchdog_user = 78
+    watchdog_key = (watchdog_user, "default")
+    watchdog_proc = FakeWatchdogProcess()
+    with bot_manager._lock:
+        bot_manager._procs[watchdog_key] = watchdog_proc
+        bot_manager._modes[watchdog_key] = "rules_ai"
+        bot_manager._tokens[watchdog_key] = "self-use-ai-token"
+        bot_manager._desired_running[watchdog_key] = True
+        bot_manager._generations[watchdog_key] = 41
+
+    reserve_transition = Mock()
+    persist_transition = Mock()
+    release_transition = Mock()
+    with (
+        patch.object(bot_manager, "revoke_token") as revoke_token,
+        patch.object(bot_manager.subprocess, "Popen") as replacement_spawn,
+    ):
+        assert bot_manager._reconcile_access_modes(
+            lambda _uid: 0,
+            now=1,
+            reserve_transition=reserve_transition,
+            persist_transition=persist_transition,
+            release_transition=release_transition,
+        ) == {}
+    reserve_transition.assert_not_called()
+    persist_transition.assert_not_called()
+    release_transition.assert_not_called()
+    revoke_token.assert_not_called()
+    replacement_spawn.assert_not_called()
+    assert bot_manager.is_running(watchdog_user) is True
+    assert bot_manager.status(watchdog_user)["automation_mode"] == "rules_ai"
+    assert bot_manager._tokens[watchdog_key] == "self-use-ai-token"
+    with (
+        patch.object(bot_manager.os, "getpgid", return_value=watchdog_proc.pid),
+        patch.object(bot_manager.os, "killpg"),
+        patch.object(bot_manager, "revoke_token"),
+    ):
+        assert bot_manager.stop(watchdog_user) == (True, "stopped")
+
+    # Exercise the API reconciliation decision itself with a tiny fake DB.
+    # This catches the dangerous regression where a live-but-unrecognized PID
+    # is silently shadowed by a second worker.
+    with tempfile.TemporaryDirectory(prefix="xianyu-recovery-app-") as root:
+        os.environ.update(
+            {
+                "SAAS_DB": str(Path(root) / "saas.db"),
+                "SAAS_TENANTS_DIR": str(Path(root) / "tenants"),
+                "SAAS_RESTORE_WORKERS": "0",
+                "SAAS_COOKIE_SECURE": "0",
+            }
+        )
+        # Importing the API is intentionally delayed until its test database
+        # points at the temporary directory.
+        import app  # noqa: PLC0415
+        os.environ["SAAS_RESTORE_WORKERS"] = "1"
+
+        class FakeDB:
+            def __init__(self, row):
+                self.row = {
+                    "desired_state": "running",
+                    "generation": 0,
+                    "started_at": None,
+                    "exit_code": None,
+                    **row,
+                }
+                self.updates = []
+                self.started_leases = []
+
+            def list_worker_runtimes(self, desired_state=None):
+                assert desired_state is None
+                return [self.row]
+
+            def acquire_control_lease(self, key, owner, **_kwargs):
+                self.started_leases.append((key, owner))
+                return "acquired"
+
+            def release_control_lease(self, key, owner):
+                self.started_leases.append(("released", key, owner))
+                return True
+
+            def get_user_by_id(self, user_id):
+                return {
+                    "id": user_id,
+                    "expires_at": self.row.get("expires_at", time.time() + 3600),
+                }
+
+            def get_shop_account(self, user_id, account_id=None):
+                return {"id": account_id, "enabled": 1}
+
+            def persist_worker_runtime(self, user_id, account_id, **fields):
+                self.updates.append((user_id, account_id, fields))
+                self.row.update(fields)
+                return self.row
+
+            def get_worker_runtime(self, user_id, account_id=None):
+                return self.row
+
+        # Waiting-login is a durable running intent, not a failed stop. An API
+        # restart must preserve it until the account has a verified snapshot.
+        waiting_db = FakeDB(
+            {
+                "user_id": 5,
+                "account_id": 1,
+                "pid": None,
+                "mode": "rules",
+                "state": "waiting_login",
+            }
+        )
+        with (
+            patch.object(app, "db", waiting_db),
+            patch.object(app, "bot_status", return_value={"connected": False}),
+            patch.object(app, "bot_start") as waiting_start,
+        ):
+            app.restore_desired_workers()
+        waiting_start.assert_not_called()
+        waiting_update = waiting_db.updates[-1][2]
+        assert waiting_update["desired_state"] == "running"
+        assert waiting_update["state"] == "waiting_login"
+        assert waiting_update["pid"] is None
+
+        # A worker-auth marker is authoritative even when a snapshot exists:
+        # recovery keeps desired running, waits for reauthorization, and makes
+        # no new authentication attempt.
+        reauth_db = FakeDB(
+            {
+                "user_id": 6,
+                "account_id": 1,
+                "pid": None,
+                "mode": "rules",
+                "state": "degraded",
+            }
+        )
+        with (
+            patch.object(app, "db", reauth_db),
+            patch.object(
+                app,
+                "_read_auth_status",
+                return_value={
+                    "code": "session_expired",
+                    "reauthorization_required": True,
+                    "updated_at": 100.0,
+                },
+            ),
+            patch.object(app, "bot_status", return_value={"connected": True}),
+            patch.object(app, "bot_adopt") as reauth_adopt,
+            patch.object(app, "bot_start") as reauth_start,
+        ):
+            app.restore_desired_workers()
+        reauth_adopt.assert_not_called()
+        reauth_start.assert_not_called()
+        reauth_update = reauth_db.updates[-1][2]
+        assert reauth_update["desired_state"] == "running"
+        assert reauth_update["state"] == "waiting_login"
+        assert reauth_update["last_error"] == "session_expired"
+
+        for protected_code in ("risk_control", "verification_required"):
+            protected_db = FakeDB({"user_id": 6, "account_id": 1, "pid": None, "mode": "rules", "state": "degraded"})
+            with (
+                patch.object(app, "db", protected_db),
+                patch.object(app, "_read_auth_status", return_value={
+                    "code": protected_code, "reauthorization_required": True,
+                    "needs_human": True, "updated_at": 100.0,
+                }),
+                patch.object(app, "bot_status", return_value={"connected": True}),
+                patch.object(app, "bot_adopt") as protected_adopt,
+                patch.object(app, "bot_start") as protected_start,
+            ):
+                app.restore_desired_workers()
+            protected_adopt.assert_not_called()
+            protected_start.assert_not_called()
+            protected_update = protected_db.updates[-1][2]
+            assert protected_update["desired_state"] == "running"
+            assert protected_update["state"] == "waiting_login"
+            assert protected_update["last_error"] == protected_code
+
+        adopted_db = FakeDB(
+            {"user_id": 7, "account_id": 1, "pid": 7001, "mode": "rules"}
+        )
+        persisted = []
+        with (
+            patch.object(app, "db", adopted_db),
+            patch.object(app, "bot_adopt", return_value=(True, "adopted")),
+            patch.object(app, "bot_start") as start,
+            patch.object(app, "_persist_worker_started", side_effect=lambda *args, **kwargs: persisted.append((args, kwargs))),
+        ):
+            app.restore_desired_workers()
+        assert start.called is False
+        assert persisted == [((7, "rules"), {"already_running": True})], persisted
+
+        class StaleListedDB(FakeDB):
+            def acquire_control_lease(self, key, owner, **kwargs):
+                result = super().acquire_control_lease(key, owner, **kwargs)
+                # An explicit stop clears auto_resume; a concurrent stop that
+                # still carried the default-on marker would resume by design.
+                self.row["desired_state"] = "stopped"
+                self.row["pid"] = None
+                self.row["auto_resume"] = 0
+                return result
+
+        stale_listed_db = StaleListedDB(
+            {"user_id": 15, "account_id": 1, "pid": 15001, "mode": "rules_ai"}
+        )
+        with (
+            patch.object(app, "db", stale_listed_db),
+            patch.object(app, "bot_adopt") as stale_adopt,
+            patch.object(app, "bot_start") as stale_restore_start,
+        ):
+            app.restore_desired_workers()
+        stale_adopt.assert_not_called()
+        stale_restore_start.assert_not_called()
+
+        stopped_pid_db = FakeDB(
+            {
+                "user_id": 16,
+                "account_id": 1,
+                "pid": 16001,
+                "mode": "rules",
+                "desired_state": "stopped",
+                "state": "degraded",
+                "auto_resume": 0,
+            }
+        )
+        with (
+            patch.object(app, "db", stopped_pid_db),
+            patch.object(app, "bot_process_id", return_value=None),
+            patch.object(app, "bot_stop", return_value=(False, "not_running")),
+            patch.object(app, "bot_terminate_pid", return_value=(True, "stopped")) as cleanup_stopped_pid,
+        ):
+            app.restore_desired_workers()
+        cleanup_stopped_pid.assert_called_once_with(16, 16001, "default")
+        stopped_cleanup = stopped_pid_db.updates[-1][2]
+        assert stopped_cleanup["desired_state"] == "stopped"
+        assert stopped_cleanup["state"] == "stopped"
+        assert stopped_cleanup["pid"] is None
+
+        failed_stopped_pid_db = FakeDB(
+            {
+                "user_id": 17,
+                "account_id": 1,
+                "pid": 17001,
+                "mode": "rules",
+                "desired_state": "stopped",
+                "state": "degraded",
+                "auto_resume": 0,
+            }
+        )
+        with (
+            patch.object(app, "db", failed_stopped_pid_db),
+            patch.object(app, "bot_process_id", return_value=None),
+            patch.object(app, "bot_stop", return_value=(False, "not_running")),
+            patch.object(
+                app, "bot_terminate_pid", return_value=(False, "pidfd_unavailable")
+            ) as failed_cleanup,
+        ):
+            app.restore_desired_workers()
+        failed_cleanup.assert_called_once_with(17, 17001, "default")
+        failed_cleanup_state = failed_stopped_pid_db.updates[-1][2]
+        assert failed_cleanup_state["desired_state"] == "stopped"
+        assert failed_cleanup_state["state"] == "degraded"
+        assert failed_cleanup_state["pid"] == 17001
+
+        persist_failure_db = FakeDB(
+            {"user_id": 14, "account_id": 1, "pid": 14001, "mode": "rules"}
+        )
+        with (
+            patch.object(app, "db", persist_failure_db),
+            patch.object(app, "bot_adopt", return_value=(True, "adopted")),
+            patch.object(app, "_persist_worker_started", side_effect=RuntimeError("persist failed")),
+            patch.object(app, "bot_stop", return_value=(True, "stopped")) as compensated_stop,
+            patch.object(app, "bot_process_id", return_value=None),
+        ):
+            app.restore_desired_workers()
+        compensated_stop.assert_called_once_with(14, "default")
+        compensation = persist_failure_db.updates[-1][2]
+        assert compensation["desired_state"] == "stopped"
+        assert compensation["state"] == "degraded"
+        assert compensation["pid"] is None
+
+        mismatch_db = FakeDB(
+            {"user_id": 8, "account_id": 1, "pid": 8001, "mode": "rules"}
+        )
+        with (
+            patch.object(app, "db", mismatch_db),
+            patch.object(app, "bot_adopt", return_value=(False, "pid_mismatch")),
+            patch.object(app, "bot_start") as start,
+        ):
+            app.restore_desired_workers()
+        assert start.called is False
+        assert mismatch_db.updates[-1][2]["last_error"] == "worker_pid_mismatch"
+
+        # Explicit AI start retires a PID now owned by this API before spawning.
+        reused_start_db = FakeDB({
+            "user_id": 84, "account_id": 1, "pid": 45141, "mode": "rules_ai",
+            "desired_state": "stopped", "state": "degraded", "auto_resume": 1,
+        })
+        reused_account = {"id": 1, "account_key": "default", "enabled": 1}
+
+        def start_after_retirement(*_args):
+            assert reused_start_db.row["pid"] is None
+            return True, "started"
+
+        with (
+            patch.object(app, "db", reused_start_db),
+            patch.object(bot_manager.os, "getpid", return_value=45141),
+            patch.object(bot_manager.os, "pidfd_open") as reused_start_pidfd,
+            patch.object(app, "bot_process_id", return_value=None),
+            patch.object(app, "bot_status", return_value={"connected": True}),
+            patch.object(app, "_require_account_worker_configuration"),
+            patch.object(app, "bot_start", side_effect=start_after_retirement) as reused_start,
+            patch.object(app, "_persist_worker_started") as reused_persist,
+        ):
+            result = app._start_account_worker_locked(
+                {"id": 84}, reused_account, "rules_ai", None,
+                validate_configuration=True, automatic=False,
+            )
+        assert result == "started"
+        reused_start.assert_called_once_with(84, "rules_ai")
+        reused_persist.assert_called_once_with(84, "rules_ai", False, reused_account)
+        reused_start_pidfd.assert_not_called()
+
+        # Startup recovery also discards only that proven stale PID and resumes
+        # an auto-resumable account even if a failed manual start set stopped.
+        reused_restore_db = FakeDB({
+            "user_id": 85, "account_id": 1, "pid": 45141, "mode": "rules_ai",
+            "desired_state": "stopped", "state": "degraded", "auto_resume": 1,
+        })
+        with (
+            patch.object(app, "db", reused_restore_db),
+            patch.object(bot_manager.os, "getpid", return_value=45141),
+            patch.object(bot_manager.os, "pidfd_open") as reused_restore_pidfd,
+            patch.object(app, "bot_status", return_value={"connected": True}),
+            patch.object(app, "bot_start", return_value=(True, "started")) as reused_restore_start,
+            patch.object(app, "_persist_worker_started") as reused_restore_persist,
+        ):
+            app.restore_desired_workers()
+        assert reused_restore_db.row["pid"] is None
+        reused_restore_start.assert_called_once_with(85, "rules_ai", "default")
+        reused_restore_persist.assert_called_once_with(85, "rules_ai", already_running=False)
+        reused_restore_pidfd.assert_not_called()
+
+        ai_db = FakeDB(
+            {"user_id": 9, "account_id": 1, "pid": 9001, "mode": "rules_ai"}
+        )
+        with (
+            patch.object(app, "db", ai_db),
+            patch.object(app, "bot_adopt", return_value=(False, "token_unavailable")),
+            patch.object(app, "bot_terminate_pid", return_value=(True, "stopped")),
+            patch.object(app, "bot_status", return_value={"connected": True}),
+            patch.object(app, "bot_start", return_value=(True, "started")),
+            patch.object(app, "_persist_worker_started") as persisted_ai,
+        ):
+            app.restore_desired_workers()
+        persisted_ai.assert_called_once_with(9, "rules_ai", already_running=False)
+
+        legacy_expired_ai_db = FakeDB(
+            {"user_id": 11, "account_id": 1, "pid": 11001, "mode": "rules_ai", "expires_at": 0}
+        )
+        with (
+            patch.object(app, "db", legacy_expired_ai_db),
+            patch.object(app, "bot_adopt", return_value=(False, "token_unavailable")) as adopt_legacy_ai,
+            patch.object(app, "bot_terminate_pid", return_value=(True, "stopped")) as terminate_legacy_ai,
+            patch.object(app, "bot_status", return_value={"connected": True}),
+            patch.object(app, "bot_start", return_value=(True, "started")) as start_legacy_ai,
+            patch.object(app, "_persist_worker_started") as persist_legacy_ai,
+        ):
+            app.restore_desired_workers()
+        adopt_legacy_ai.assert_called_once_with(11, 11001, "rules_ai", "default")
+        terminate_legacy_ai.assert_called_once_with(11, 11001, "default")
+        start_legacy_ai.assert_called_once_with(11, "rules_ai", "default")
+        persist_legacy_ai.assert_called_once_with(11, "rules_ai", already_running=False)
+
+        dead_ai_db = FakeDB(
+            {"user_id": 10, "account_id": 1, "pid": 10001, "mode": "rules_ai"}
+        )
+        with (
+            patch.object(app, "db", dead_ai_db),
+            patch.object(app, "bot_adopt", return_value=(False, "pid_dead")),
+            patch.object(app, "bot_terminate_pid") as terminate_dead,
+            patch.object(app, "bot_status", return_value={"connected": True}),
+            patch.object(app, "bot_start", return_value=(True, "started")),
+            patch.object(app, "_persist_worker_started") as persisted_dead_ai,
+        ):
+            app.restore_desired_workers()
+        terminate_dead.assert_not_called()
+        persisted_dead_ai.assert_called_once_with(10, "rules_ai", already_running=False)
+
+        class LookupFailureDB(FakeDB):
+            def __init__(self):
+                super().__init__({"user_id": 12, "account_id": 1, "pid": None, "mode": "rules"})
+                self.rows = [
+                    {
+                        "user_id": 12,
+                        "account_id": 1,
+                        "pid": None,
+                        "mode": "rules",
+                        "desired_state": "running",
+                        "generation": 0,
+                    },
+                    {
+                        "user_id": 13,
+                        "account_id": 1,
+                        "pid": None,
+                        "mode": "rules",
+                        "desired_state": "running",
+                        "generation": 0,
+                    },
+                ]
+
+            def list_worker_runtimes(self, desired_state=None):
+                assert desired_state is None
+                return self.rows
+
+            def get_worker_runtime(self, user_id, account_id=None):
+                return next(
+                    (
+                        row
+                        for row in self.rows
+                        if row["user_id"] == user_id and row["account_id"] == account_id
+                    ),
+                    None,
+                )
+
+            def get_user_by_id(self, user_id):
+                if user_id == 12:
+                    raise RuntimeError("lookup failed")
+                return {"id": user_id, "expires_at": time.time() + 3600}
+
+        lookup_db = LookupFailureDB()
+        with (
+            patch.object(app, "db", lookup_db),
+            patch.object(app, "bot_status", return_value={"connected": True}),
+            patch.object(app, "bot_start", return_value=(True, "started")) as continued_start,
+            patch.object(app, "_persist_worker_started") as continued_persist,
+        ):
+            app.restore_desired_workers()
+        released_keys = [entry[1] for entry in lookup_db.started_leases if entry[0] == "released"]
+        assert "worker-control:12:1" in released_keys
+        assert "worker-control:13:1" in released_keys
+        continued_start.assert_called_once_with(13, "rules", "default")
+        continued_persist.assert_called_once_with(13, "rules", already_running=False)
+
+        class CapacityDB(FakeDB):
+            def __init__(self):
+                super().__init__({"user_id": 22, "account_id": 1, "pid": None, "mode": "rules"})
+                self.rows = [dict(self.row), {**self.row, "user_id": 23, "account_id": 2, "pid": 23001}]
+
+            def list_worker_runtimes(self, desired_state=None):
+                return self.rows
+
+            def get_worker_runtime(self, user_id, account_id=None):
+                return next(row for row in self.rows if row["user_id"] == user_id and row["account_id"] == account_id)
+
+            def persist_worker_runtime(self, user_id, account_id, **fields):
+                row = self.get_worker_runtime(user_id, account_id)
+                row.update(fields)
+                self.updates.append((user_id, account_id, fields))
+                return row
+
+        capacity_db = CapacityDB()
+        actions = []
+        def adopt_before_start(uid, *_args):
+            actions.append(("adopt", uid))
+            return True, "adopted"
+        def blocked_start(uid, *_args):
+            actions.append(("start", uid))
+            return False, "max_bots_reached"
+        with (
+            patch.object(app, "db", capacity_db),
+            patch.object(app, "bot_status", return_value={"connected": True}),
+            patch.object(app, "bot_adopt", side_effect=adopt_before_start),
+            patch.object(app, "bot_start", side_effect=blocked_start),
+            patch.object(app, "_persist_worker_started"),
+            patch.object(app, "bot_stop") as no_forced_stop,
+        ):
+            app.restore_desired_workers()
+        assert actions == [("adopt", 23), ("start", 22)], actions
+        assert capacity_db.rows[0]["desired_state"] == "running"
+        assert capacity_db.rows[0]["state"] == "capacity_limited"
+        assert capacity_db.rows[0]["last_error"] == "max_bots_reached"
+        no_forced_stop.assert_not_called()
+
+    print("worker-recovery contract: safe adoption, token replacement, capacity-first recovery, lookup isolation and PID reuse protection passed")
+
+
+if __name__ == "__main__":
+    if "--migration-only" in sys.argv:
+        _test_legacy_worker_runtime_migration()
+    else:
+        main()

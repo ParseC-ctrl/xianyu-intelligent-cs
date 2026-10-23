@@ -1,0 +1,11 @@
+[extend]
+useDefault = true
+
+# Public protocol app identifier inherited from the attributed upstream.
+# Scope this exception to the exact identifier and protocol implementation files.
+[[allowlists]]
+description = "Public upstream messaging protocol app identifier, not an account credential"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['^444e9908a51d1cb236a27862abc769c9$']
+paths = ['(^|/)worker/(XianyuApis|main)\.py$']

@@ -1,0 +1,47 @@
+name: xianyu-intelligent-cs
+services:
+  data-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xianyu-intelligent-cs:local
+    user: "0:0"
+    entrypoint: ["/app/backend/.venv/bin/python", "-c", "import os; os.chown('/data',10001,10001); os.chmod('/data',0o700)"]
+    volumes:
+      - customer-data:/data
+    restart: "no"
+  customer:
+    image: xianyu-intelligent-cs:local
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${SAAS_CUSTOMER_WEB_PORT:-4173}:4173"
+    env_file: config/customer.env
+    environment:
+      SAAS_ENV: production
+      SAAS_TESTING: "0"
+      SAAS_COOKIE_SECURE: "0"
+      SAAS_PUBLIC_ORIGIN: "http://127.0.0.1:${SAAS_CUSTOMER_WEB_PORT:-4173}"
+      SAAS_TRUSTED_HOSTS: "127.0.0.1:${SAAS_CUSTOMER_WEB_PORT:-4173},127.0.0.1:8096"
+      SAAS_TRUSTED_PROXY_IPS: "127.0.0.1,::1"
+      SAAS_MAX_BOTS: "1"
+      SAAS_ALLOW_REGISTRATION: "0"
+      SAAS_KNOWLEDGE_ONLY: "1"
+      SAAS_CUSTOMER_SERVICE_ONLY: "1"
+      SAAS_DISABLE_UPSTREAM_UPDATES: "1"
+      SAAS_DB: /data/saas.db
+      SAAS_TENANTS_DIR: /data/tenants
+      SAAS_BOT_ROOT: /app/worker
+      SAAS_APP_CODE_DIR: /data/app-code
+    volumes:
+      - customer-data:/data
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+volumes:
+  customer-data:
