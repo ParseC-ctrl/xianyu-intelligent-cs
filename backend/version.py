@@ -11,11 +11,11 @@ from pathlib import Path
 
 # Must match package.json; image builds validate this before publication.
 VERSION = "0.4.7"
-ASSET_VERSION = "20261003-01"
+ASSET_VERSION = "20261023-01"
 RELEASE_CHANNEL = "release"
 # Same value promises bidirectional data compatibility for Docker updates.
 # Increment for breaking database, configuration or credential format changes.
-UPDATE_DATA_VERSION = 1
+UPDATE_DATA_VERSION = 2
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_INFO_FILE = Path(__file__).with_name("build-info.json")
 

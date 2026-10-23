@@ -315,7 +315,7 @@ class MaterialKnowledgeStore:
             raise MaterialKnowledgeError("FAQ 必须是最多 50 条的列表", "faq_invalid")
         result, seen = [], set()
         for faq in faqs:
-            if not isinstance(faq, dict) or set(faq) - {"id", "question", "answer", "enabled", "topics"}:
+            if not isinstance(faq, dict) or set(faq) - {"id", "question", "answer", "enabled", "topics", "fixed_reply"}:
                 raise MaterialKnowledgeError("FAQ 字段无效", "faq_invalid")
             identifier = faq.get("id")
             if not isinstance(identifier, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", identifier) or identifier in seen:
@@ -323,6 +323,9 @@ class MaterialKnowledgeStore:
             question, answer = faq.get("question"), faq.get("answer")
             if not knowledge_text_safe(question, 300) or not knowledge_text_safe(answer, 1500):
                 raise MaterialKnowledgeError("FAQ 问答为空、过长或含不安全内容", "faq_unsafe")
+            fixed_reply = faq.get("fixed_reply", False)
+            if not isinstance(fixed_reply, bool):
+                raise MaterialKnowledgeError("FAQ 固定回复状态无效", "faq_invalid")
             enabled = faq.get("enabled", False)
             topics = faq.get("topics", [])
             if not isinstance(enabled, bool) or not isinstance(topics, list) or len(topics) > 8:
@@ -332,6 +335,8 @@ class MaterialKnowledgeStore:
             seen.add(identifier)
             result.append({"id": identifier, "question": question.strip(), "answer": answer.strip(),
                            "enabled": enabled, "topics": sorted(set(topic.strip() for topic in topics))})
+            if fixed_reply:
+                result[-1]["fixed_reply"] = True
         return result
 
     def get_faqs(self) -> list[dict]:

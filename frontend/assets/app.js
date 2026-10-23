@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-intelligent-cs";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20261003-01";
+  const ASSET_VERSION = "20261023-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -2151,6 +2151,7 @@
       '<label class="field-group"><span>审核后的准确回答</span><textarea data-faq-answer rows="3" maxlength="1500" required>' + esc(faq.answer) + '</textarea></label>' +
       '<label class="field-group"><span>相关主题（可选，用逗号分隔）</span><input data-faq-topics maxlength="327" value="' + esc((faq.topics || []).join("，")) + '" placeholder="例如：护理，尺码"></label>' +
       '<div class="form-actions"><label class="checkbox-field"><input data-faq-enabled type="checkbox"' + (faq.enabled === true ? ' checked' : '') + '><span>已人工审核，启用此回答</span></label>' +
+      '<label class="checkbox-field"><input data-faq-fixed type="checkbox"' + (faq.fixed_reply === true ? ' checked' : '') + '><span>按原文回复（AI 仅识别意图）</span></label>' +
       '<button class="button button-secondary button-compact" type="button" data-faq-remove="' + esc(faq.id) + '">删除</button></div></fieldset>').join("") || '<p class="field-hint">还没有常见问答。添加后先核对回答，再勾选审核启用。</p>';
   }
 
@@ -2160,6 +2161,7 @@
       answer: row.querySelector("[data-faq-answer]").value.trim(),
       topics: row.querySelector("[data-faq-topics]").value.split(/[,，]/).map((value) => value.trim()).filter(Boolean),
       enabled: row.querySelector("[data-faq-enabled]").checked === true,
+      fixed_reply: row.querySelector("[data-faq-fixed]").checked === true,
     }));
     if (validate && (faqs.length > 50 || faqs.some((faq) => !/^[a-zA-Z0-9_-]{1,80}$/.test(faq.id)
         || !faq.question || faq.question.length > 300 || !faq.answer || faq.answer.length > 1500
@@ -11256,7 +11258,7 @@
     });
     $("#materialFaqList")?.addEventListener("input", (event) => {
       state.ai.faqsDirty = true;
-      if (event.target.matches("[data-faq-question], [data-faq-answer]")) {
+      if (event.target.matches("[data-faq-question], [data-faq-answer], [data-faq-topics], [data-faq-fixed]")) {
         const reviewed = event.target.closest("[data-faq-id]")?.querySelector("[data-faq-enabled]");
         if (reviewed) reviewed.checked = false;
       }
