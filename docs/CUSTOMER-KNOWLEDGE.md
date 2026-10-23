@@ -145,3 +145,5 @@ DeepSeek Chat Completions 是无状态接口，必须每轮传历史；上下文
 已有 Windows 部署先更新代码，再通过页面保存或 `scripts/update-local-faqs.py --file <本地更新文件>` 合并 FAQ。工具只访问回环地址，使用已有管理员凭据并备份旧 FAQ，按 ID 更新，保留其他问答；运行时不要同时编辑 FAQ。固定回复为新的 FAQ 数据字段，数据兼容版本升为 2；启用后不要直接回退到不能读取该字段的旧版本。
 
 物流问法排查可运行 `python3 scripts/update-local-faqs.py --check --question "下单发什么快递"`，读取本地 FAQ 状态、规则试答原因码和待店主处理的会话数量，不修改 FAQ、不发送消息。附加 `--file <本地更新文件>` 可核对是否漏导入，附加 `--model` 才会调用模型做本地试答。真实聊天曾进入接管后须由管理员明确恢复 AI，修复 FAQ 不会自动解除会话保护。
+
+多账号环境下，更新和检查命令传 `--account <实际account_key>`，与工作台当前选择的账号一致；不传时只检查或更新 default 账号，不会跨账号复制政策。

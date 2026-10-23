@@ -53,6 +53,7 @@ def main():
         credentials.write_text(json.dumps({'username':'fixture','password':'private-fixture-password'}))
         calls=[]
         def open_local(req,timeout):
+            assert req.get_header('X-shop-account') == 'default'
             path=req.full_url.split('/xianyu-intelligent-cs',1)[1]
             calls.append((req.get_method(),path))
             values={'/api/auth/login':{},'/api/auth/logout':{},'/api/bot/materials/faqs':{'faqs':rows},

@@ -5,6 +5,7 @@ import datetime
 import http.cookiejar
 import json
 import os
+import re
 from pathlib import Path
 import urllib.parse
 import urllib.error
@@ -38,8 +39,11 @@ def main():
     parser.add_argument('--check', action='store_true', help='Read-only local FAQ/preview diagnosis; never sends buyer messages')
     parser.add_argument('--question', default='')
     parser.add_argument('--model', action='store_true', help='Opt-in model preview in check mode; may consume model tokens')
+    parser.add_argument('--account', default='default', help='Same shop account key as the workbench')
     parser.add_argument('--credentials', type=Path, default=root/'.local/windows-admin.json')
     args = parser.parse_args()
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', args.account):
+        parser.error('invalid shop account key')
     parsed = urllib.parse.urlsplit(args.origin)
     if parsed.scheme != 'http' or parsed.hostname not in {'127.0.0.1', 'localhost'} or parsed.username or parsed.password or parsed.path not in {'', '/'} or parsed.query or parsed.fragment:
         parser.error('origin must be a local loopback HTTP origin')
@@ -53,7 +57,7 @@ def main():
     def request(path, method='GET', payload=None):
         req = urllib.request.Request(args.origin.rstrip('/')+'/xianyu-intelligent-cs'+path,
             data=json.dumps(payload).encode() if payload is not None else None, method=method,
-            headers={'Origin':args.origin.rstrip('/'), 'X-SaaS-Browser-Intent':'browser-write', 'Content-Type':'application/json'})
+            headers={'Origin':args.origin.rstrip('/'), 'X-SaaS-Browser-Intent':'browser-write', 'Content-Type':'application/json', 'X-Shop-Account':args.account})
         with opener.open(req, timeout=30) as response:
             return json.loads(response.read())
     logged_in = False
@@ -63,7 +67,7 @@ def main():
         before = request('/api/bot/materials/faqs')['faqs']
         if args.check:
             expected = {row['id']:row for row in updates}
-            report = {'service':request('/api/version/public'), 'faq_status':[
+            report = {'account_key':args.account, 'service':request('/api/version/public'), 'faq_status':[
                 {'id':row['id'], 'enabled':row.get('enabled') is True,
                  'fixed_reply':row.get('fixed_reply') is True,
                  'question_is_exact_alias':args.question == row.get('question') or args.question in row.get('topics', []),
