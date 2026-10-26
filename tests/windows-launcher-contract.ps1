@@ -35,17 +35,18 @@ function global:wsl.exe {
     '__XIANYU_URL__=http://127.0.0.1:4173/xianyu-intelligent-cs/'
     '__XIANYU_PROJECT__=/home/fixture/apps/existing'
 }
+function global:Start-Process { param($FilePath) throw 'Synthetic missing default browser' }
 function global:Invoke-WebRequest { param($Uri,[switch]$UseBasicParsing,$TimeoutSec) return [pscustomobject]@{StatusCode=200} }
-& $Target -Distro Ubuntu -ProjectPath "/home/fixture/space ' quote" -NoBrowser -NoPause
+& $Target -Distro Ubuntu -ProjectPath "/home/fixture/space ' quote" -NoBrowser:($Scenario -ne 'browser-fails') -NoPause
 exit $LASTEXITCODE
 '@ | Set-Content -LiteralPath $Wrapper -Encoding UTF8
-    foreach ($Scenario in @('success','wsl1','app-fails')) {
+    foreach ($Scenario in @('success','browser-fails','wsl1','app-fails')) {
         $Settings = Join-Path $Temporary '.local\windows-start.json'
         if (Test-Path $Settings) { Remove-Item -LiteralPath $Settings }
         $State = Join-Path $Temporary ($Scenario+'.jsonl')
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Wrapper -Target $Target -Scenario $Scenario -StatePath $State
         $Code=$LASTEXITCODE
-        if ($Scenario -eq 'success') {
+        if (@('success','browser-fails') -contains $Scenario) {
             if ($Code -ne 0) { throw 'Normal startup failed' }
             $Rows=@(Get-Content -LiteralPath $State -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json })
             if ($Rows.Count -ne 2 -or -not $Rows[0].Root -or $Rows[1].Root) { throw 'Root must only be used for Docker startup' }
@@ -63,3 +64,5 @@ exit $LASTEXITCODE
 } finally {
     Remove-Item -LiteralPath $Temporary -Recurse -Force
 }
+
+exit 0

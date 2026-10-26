@@ -178,7 +178,10 @@ try {
         throw 'The service is ready inside WSL, but Windows localhost access failed. Check WSL localhost forwarding; do not reinstall or delete data.'
     }
     Write-Host "Service ready: $script:ServiceUrl"
-    if (-not $NoBrowser) { Start-Process $script:ServiceUrl }
+    if (-not $NoBrowser) {
+        try { Start-Process $script:ServiceUrl }
+        catch { Write-Warning "Service is ready. Open $script:ServiceUrl manually; no default browser could be launched." }
+    }
 } catch {
     Write-Host ('Startup failed: ' + $_.Exception.Message) -ForegroundColor Red
     $ExitCode = 1
