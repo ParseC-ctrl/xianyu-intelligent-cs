@@ -5,6 +5,7 @@ param(
     [string]$ProjectPath = '',
     [string]$WslUser = '',
     [switch]$Build,
+    [switch]$Update,
     [switch]$NoBrowser,
     [switch]$NoPause
 )
@@ -105,6 +106,42 @@ valid_project "$project" || { echo 'Existing deployment/config not found. This l
 cd -- "$project"
 project="$PWD"
 command -v python3 >/dev/null || { echo 'python3 is required inside WSL.' >&2; exit 1; }
+if [[ "$action" == update ]]; then
+    command -v git >/dev/null || { echo 'git is required inside WSL for updating.' >&2; exit 1; }
+    command -v flock >/dev/null || { echo 'flock (util-linux) is required for safe updates.' >&2; exit 1; }
+    mkdir -p .local
+    exec 9>.local/windows-update.lock
+    flock -n 9 || { echo 'Another update is already running for this deployment.' >&2; exit 1; }
+    [[ "$(git rev-parse --show-toplevel 2>/dev/null)" == "$PWD" ]] || { echo 'This deployment is not a Git checkout. Follow the migration instructions first.' >&2; exit 1; }
+    [[ "$(git symbolic-ref --quiet --short HEAD)" == main ]] || { echo 'Expected the main branch. Preserve local work and resolve the branch before updating.' >&2; exit 1; }
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo 'Tracked code has local modifications. Preserve and review them before updating; no files were overwritten.' >&2
+        exit 1
+    fi
+    remote="$(git remote get-url origin)"
+    case "$remote" in
+        https://github.com/ParseC-ctrl/xianyu-intelligent-cs.git|https://github.com/ParseC-ctrl/xianyu-intelligent-cs|git@github.com:ParseC-ctrl/xianyu-intelligent-cs.git) ;;
+        *) echo 'Origin is not the expected project repository. Review it before updating.' >&2; exit 1 ;;
+    esac
+    before="$(git rev-parse HEAD)"
+    echo "Current revision: $before"
+    export GIT_TERMINAL_PROMPT=0
+    echo 'Fetching latest main...'
+    git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+    git merge-base --is-ancestor HEAD refs/remotes/origin/main || { echo 'Local commits diverge from or are ahead of origin/main. Review them before updating.' >&2; exit 1; }
+    git merge --ff-only --no-edit refs/remotes/origin/main
+    after="$(git rev-parse HEAD)"
+    echo "Building revision: $after"
+    # Record revisions only; private FAQ, credentials and runtime data stay local.
+    python3 - "$before" "$after" <<'PYRECORD'
+import json,sys,time
+from pathlib import Path
+p=Path('.local/windows-update.json')
+p.write_text(json.dumps({'previous_revision':sys.argv[1],'target_revision':sys.argv[2],'started_at':time.time()}))
+p.chmod(0o600)
+PYRECORD
+    action=start
+fi
 echo "Starting existing deployment: $project"
 if [[ "$action" == run ]] && ! grep -Fq 'start|run)' scripts/customer.sh; then
     echo 'Legacy startup script detected; using its existing start action (may rebuild).'
@@ -165,6 +202,7 @@ try {
     Invoke-WslScript $EngineScript 'root'
     $Action = 'run'
     if ($Build) { $Action = 'start' }
+    if ($Update) { $Action = 'update' }
     $Parameters = "project_encoded='$(Encode-Text $ProjectPath)'`naction_encoded='$(Encode-Text $Action)'`n"
     Invoke-WslScript ($Parameters + $ServiceScript) $WslUser
     if (-not $script:ServiceUrl -or -not $script:ResolvedProject) { throw 'Startup did not report a ready service.' }
@@ -177,6 +215,7 @@ try {
     } catch {
         throw 'The service is ready inside WSL, but Windows localhost access failed. Check WSL localhost forwarding; do not reinstall or delete data.'
     }
+    if ($Update) { Write-Host 'Code update, container rebuild and local checks completed.' }
     Write-Host "Service ready: $script:ServiceUrl"
     if (-not $NoBrowser) {
         try { Start-Process $script:ServiceUrl }

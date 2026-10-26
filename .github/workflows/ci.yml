@@ -44,6 +44,7 @@ jobs:
           npm run test:repository
           python tests/public-data-contract.py
           python tests/windows-launcher-shell-contract.py
+          python tests/windows-updater-shell-contract.py
           npm run test:syntax
           npm run test:ai
           npm run test:knowledge

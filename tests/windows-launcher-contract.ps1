@@ -6,11 +6,15 @@ $Tokens = $null
 $ParseErrors = $null
 [void][System.Management.Automation.Language.Parser]::ParseFile($Source, [ref]$Tokens, [ref]$ParseErrors)
 if ($ParseErrors.Count) { throw ($ParseErrors | Out-String) }
+$UpdateSource = Join-Path $ProjectRoot 'Update-XianyuIntelligentCs.ps1'
+[void][System.Management.Automation.Language.Parser]::ParseFile($UpdateSource, [ref]$Tokens, [ref]$ParseErrors)
+if ($ParseErrors.Count) { throw ($ParseErrors | Out-String) }
 $Temporary = Join-Path ([IO.Path]::GetTempPath()) ('xianyu-launcher-test-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $Temporary | Out-Null
 try {
     $Target = Join-Path $Temporary 'Start-XianyuIntelligentCs.ps1'
     Copy-Item -LiteralPath $Source -Destination $Target
+    Copy-Item -LiteralPath $UpdateSource -Destination (Join-Path $Temporary 'Update-XianyuIntelligentCs.ps1')
     $Wrapper = Join-Path $Temporary 'fake-wsl.ps1'
     @'
 param([string]$Target,[string]$Scenario,[string]$StatePath)
@@ -40,13 +44,15 @@ function global:Invoke-WebRequest { param($Uri,[switch]$UseBasicParsing,$Timeout
 & $Target -Distro Ubuntu -ProjectPath "/home/fixture/space ' quote" -NoBrowser:($Scenario -ne 'browser-fails') -NoPause
 exit $LASTEXITCODE
 '@ | Set-Content -LiteralPath $Wrapper -Encoding UTF8
-    foreach ($Scenario in @('success','browser-fails','wsl1','app-fails')) {
+    foreach ($Scenario in @('success','update','browser-fails','wsl1','app-fails')) {
         $Settings = Join-Path $Temporary '.local\windows-start.json'
         if (Test-Path $Settings) { Remove-Item -LiteralPath $Settings }
         $State = Join-Path $Temporary ($Scenario+'.jsonl')
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Wrapper -Target $Target -Scenario $Scenario -StatePath $State
+        $EntryPoint = $Target
+        if ($Scenario -eq 'update') { $EntryPoint = Join-Path $Temporary 'Update-XianyuIntelligentCs.ps1' }
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Wrapper -Target $EntryPoint -Scenario $Scenario -StatePath $State
         $Code=$LASTEXITCODE
-        if (@('success','browser-fails') -contains $Scenario) {
+        if (@('success','update','browser-fails') -contains $Scenario) {
             if ($Code -ne 0) { throw 'Normal startup failed' }
             $Rows=@(Get-Content -LiteralPath $State -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json })
             if ($Rows.Count -ne 2 -or -not $Rows[0].Root -or $Rows[1].Root) { throw 'Root must only be used for Docker startup' }
@@ -54,6 +60,7 @@ exit $LASTEXITCODE
             $Encoded=[regex]::Match($Rows[1].Body,"project_encoded='([^']*)'").Groups[1].Value
             $Decoded=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Encoded))
             if ($Decoded -ne "/home/fixture/space ' quote") { throw 'Project argument corrupted' }
+            if ($Scenario -eq 'update' -and -not $Rows[1].Body.Contains("action_encoded='dXBkYXRl'")) { throw 'Update wrapper did not request an update' }
         } else {
             if ($Code -eq 0) { throw 'Failure was reported as success' }
             if (Test-Path $Settings) { throw 'Failed startup overwrote saved selection' }

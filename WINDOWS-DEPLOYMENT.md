@@ -331,8 +331,37 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\实际目录\Start-X
 
 脚本仅以 WSL root 启动本地 Docker daemon，随后以 WSL 默认用户或 `-WslUser` 指定用户运行应用脚本。Docker 已就绪时直接复用；未就绪时按 systemd、已有 init 脚本、手动 dockerd 的顺序选择适用分支，避免重复启动 daemon。无法使用 Docker socket 时明确报错，不擅自修改用户组或以 root 创建应用配置。
 
-日常启动优先使用已有镜像，调用 `scripts/customer.sh run`，不自动拉取 Git 或构建镜像；较旧运行副本尚无 run 命令时沿用其 start 命令并提示可能构建。需要源码更新时先按升级步骤拉取并检查代码，再为 `.ps1` 增加 `-Build`，执行现有构建与启动流程。两种模式都保留已配置的私有 FAQ 自动同步，并保留数据卷、主密钥、账号状态及会话接管状态。
+日常启动优先使用已有镜像，调用 `scripts/customer.sh run`，不自动拉取 Git 或构建镜像；较旧运行副本尚无 run 命令时沿用其 start 命令并提示可能构建。需要仅重建本地代码时增加 `-Build`；需要自动拉取最新源码并重建时增加 `-Update`，或使用下节的一键更新入口。两种模式都保留已配置的私有 FAQ 自动同步，并保留数据卷、主密钥、账号状态及会话接管状态。
 
 脚本会检查本地 API 就绪、Windows 页面可访问，成功后显示并打开工作台。`-NoBrowser` 可只启动而不打开浏览器，`-NoPause` 可结束后不等待回车。若 Windows localhost 转发不可用，会明确区分“WSL 内服务已启动”和“Windows 无法访问”，不会删库重装或修改防火墙。执行策略 Bypass 仅适用于这一进程，不修改系统长期策略。
 
 关闭启动窗口不会执行停止命令；WSL 停止、Windows 关机或休眠仍可能中断服务。脚本不设置开机任务、不批量恢复会话、不扫码、不主动同步商品或发送测试消息；已有明确启用的客服可能按原来的运行状态恢复连接。此脚本需在用户 Windows 实机进行最终验收。
+
+
+## 13. 一键拉取、重建并启动（PowerShell）
+
+首次将仓库中最新的 `Start-XianyuIntelligentCs.ps1` 和 `Update-XianyuIntelligentCs.ps1` 放在 Windows 同一目录（例如桌面）。更新入口复用启动入口，两份文件需同时保留；不要求安装 Windows Docker 或打开 Agent。已有旧版启动脚本时也要替换为最新文件。不要从共享盘复制 Mac 的 `.local/compose.local.yml`、密钥或凭据。
+
+右键 `Update-XianyuIntelligentCs.ps1`，选择“使用 PowerShell 运行”，即自动拉取、构建、启动及检查。首次沿用同目录 `.local/windows-start.json` 的 WSL 发行版、Linux 运行目录和用户；未保存选择或存在多个候选时，先显式指定一次：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\Desktop\Update-XianyuIntelligentCs.ps1" -Distro "Ubuntu-22.04" -ProjectPath "/home/你的WSL用户/apps/xianyu-intelligent-cs-public" -WslUser "你的WSL用户" -NoPause
+```
+
+保存成功后可简化为：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\Desktop\Update-XianyuIntelligentCs.ps1" -NoPause
+```
+
+只保留单份启动脚本也可以使用同等命令：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\Desktop\Start-XianyuIntelligentCs.ps1" -Update -NoPause
+```
+
+脚本启动 WSL2 Docker 后，在已有运行目录执行 Git 检查、获取公开仓库 `origin/main`、快进更新，然后调用最新版 `scripts/customer.sh start` 重建和启动容器。即使代码已是最新，也会执行构建启动流程。确认本地 API 和 Windows 页面可访问后才显示完成。已有私有 FAQ 自动同步配置继续生效；源文件不可用或导入失败时报告失败。没有配置 FAQ 同步时保持原来的本地问答。
+
+遇到代码未提交、分支不是 main、本地存在额外提交、远程仓库不符、网络错误或同时运行另一更新任务时停止；不执行强制覆盖、删库、卷删除、密钥初始化或管理员重置。未跟踪及忽略的配置保留；未跟踪文件与新源码冲突时 Git 会停止合并，需要自行整理。构建失败时不会因为构建步骤主动停止原有容器；构建完成进入容器切换后若检查失败，应查看本地错误及容器状态，不能视为更新成功。
+
+`.local/windows-update.json` 记录本次更新前和目标提交，供排错使用，不是自动回滚承诺。更新会短暂重建服务；已有运行的客服可能按其原有运行意图恢复，未启用的客服不会因该脚本自动启用。脚本不扫码、不做商品同步或模型试答。重要更新前仍建议按原部署方式备份数据卷和私有配置。Windows WSL 实机的最终部署效果需要用户验收。
