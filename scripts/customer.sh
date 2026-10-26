@@ -20,13 +20,17 @@ if [[ -f .local/compose.local.yml ]]; then
   compose_files+=(-f .local/compose.local.yml)
 fi
 case "${1:-start}" in
-  start)
+  start|run)
     python3 scripts/sync-local-faqs.py --validate
-    "${compose[@]}" --env-file config/customer.env "${compose_files[@]}" up -d --build
+    if [[ "${1:-start}" == run ]]; then
+      "${compose[@]}" --env-file config/customer.env "${compose_files[@]}" up -d --no-build
+    else
+      "${compose[@]}" --env-file config/customer.env "${compose_files[@]}" up -d --build
+    fi
     python3 scripts/sync-local-faqs.py
     ;;
   stop) "${compose[@]}" --env-file config/customer.env "${compose_files[@]}" stop ;;
   status) "${compose[@]}" --env-file config/customer.env "${compose_files[@]}" ps ;;
   logs) "${compose[@]}" --env-file config/customer.env "${compose_files[@]}" logs --tail=100 customer ;;
-  *) printf '%s\n' '用法：bash scripts/customer.sh [start|stop|status|logs]' >&2; exit 1 ;;
+  *) printf '%s\n' '用法：bash scripts/customer.sh [start|run|stop|status|logs]' >&2; exit 1 ;;
 esac

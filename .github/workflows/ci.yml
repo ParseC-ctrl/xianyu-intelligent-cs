@@ -43,9 +43,19 @@ jobs:
         run: |
           npm run test:repository
           python tests/public-data-contract.py
+          python tests/windows-launcher-shell-contract.py
           npm run test:syntax
           npm run test:ai
           npm run test:knowledge
           npm run test:auto-worker
           npm run test:deploy
           npm run test:docker-install
+
+  windows-launcher:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Windows PowerShell 5.1 launcher
+        shell: powershell
+        run: tests/windows-launcher-contract.ps1

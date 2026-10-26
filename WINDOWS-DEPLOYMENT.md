@@ -308,3 +308,31 @@ bash scripts/customer.sh start
 没有配置过自动同步时保持旧行为并明确提示跳过。已经配置后，如果共享盘未挂载、文件损坏或凭据文件缺失，预检失败会阻止本次重建；服务启动后发生登录、API 或合并失败则命令返回失败，既有数据保留，不能报告部署全部完成。排障时查看本地错误和备份，不删库、不换密钥。不自动恢复接管会话，不调用模型、不请求闲鱼、不刷新商品，也不自动同步 Excel 或替换知识库。
 
 换运行目录时须安全迁移本机 `.local/faq-sync.json` 及管理员凭据，并核对绝对路径；不要将机器配置、输入快照、备份、真实知识库或政策文件加入 Git、Release 或 Actions 附件。
+
+## 12. 无需 Agent 的日常启动（PowerShell）
+
+根目录 `Start-XianyuIntelligentCs.ps1` 支持 Windows PowerShell 5.1。可复制到桌面单独使用，不必安装 Windows Docker CLI 或 Docker Desktop，也不需要把 Windows PowerShell 以管理员身份运行。
+
+**方式一：文件启动。** 在资源管理器中右键该文件，选择“使用 PowerShell 运行”。普通双击 `.ps1` 在很多系统中会打开编辑器，不能视为启动。脚本会识别已安装的 WSL 发行版和原容器的运行目录；存在多个发行版或多个候选目录时停止并提示指定参数，不创建新部署。首次成功后把选择保存在脚本旁的 `.local/windows-start.json`，后续右键可直接复用。
+
+**方式二：PowerShell 命令启动。** 将路径替换为 `.ps1` 文件实际位置：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\实际目录\Start-XianyuIntelligentCs.ps1" -NoPause
+```
+
+首次有多个候选时，显式传入真实参数；示例值不是机器实际配置：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\实际目录\Start-XianyuIntelligentCs.ps1" -Distro "Ubuntu" -ProjectPath "/home/你的WSL用户/apps/xianyu-intelligent-cs-public" -NoPause
+```
+
+如需使用原部署用户，增加 `-WslUser "实际用户名"`。查询信息可运行 `wsl --list --verbose` 和 `wsl --exec bash -lc 'find ~/apps -maxdepth 3 -name compose.customer.yml 2>/dev/null'`；第二条查询默认发行版，多发行版时加 `--distribution` 指定。项目路径必须是 WSL Linux 路径。脚本运行位置可与 WSL 项目位置不同。
+
+脚本仅以 WSL root 启动本地 Docker daemon，随后以 WSL 默认用户或 `-WslUser` 指定用户运行应用脚本。Docker 已就绪时直接复用；未就绪时按 systemd、已有 init 脚本、手动 dockerd 的顺序选择适用分支，避免重复启动 daemon。无法使用 Docker socket 时明确报错，不擅自修改用户组或以 root 创建应用配置。
+
+日常启动优先使用已有镜像，调用 `scripts/customer.sh run`，不自动拉取 Git 或构建镜像；较旧运行副本尚无 run 命令时沿用其 start 命令并提示可能构建。需要源码更新时先按升级步骤拉取并检查代码，再为 `.ps1` 增加 `-Build`，执行现有构建与启动流程。两种模式都保留已配置的私有 FAQ 自动同步，并保留数据卷、主密钥、账号状态及会话接管状态。
+
+脚本会检查本地 API 就绪、Windows 页面可访问，成功后显示并打开工作台。`-NoBrowser` 可只启动而不打开浏览器，`-NoPause` 可结束后不等待回车。若 Windows localhost 转发不可用，会明确区分“WSL 内服务已启动”和“Windows 无法访问”，不会删库重装或修改防火墙。执行策略 Bypass 仅适用于这一进程，不修改系统长期策略。
+
+关闭启动窗口不会执行停止命令；WSL 停止、Windows 关机或休眠仍可能中断服务。脚本不设置开机任务、不批量恢复会话、不扫码、不主动同步商品或发送测试消息；已有明确启用的客服可能按原来的运行状态恢复连接。此脚本需在用户 Windows 实机进行最终验收。

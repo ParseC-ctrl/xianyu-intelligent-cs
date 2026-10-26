@@ -96,3 +96,5 @@ node_modules/
 **/faq-sync-input.json
 **/faq-sync-status.json
 **/faq-backup-*.json
+
+**/windows-start.json

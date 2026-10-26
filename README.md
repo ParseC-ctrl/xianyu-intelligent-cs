@@ -28,3 +28,5 @@ Excel 和真实店铺 FAQ 由使用者自行保存在本地 `deployment-assets/`
 保留 **GPL-3.0-only** 许可证，见 [LICENSE](LICENSE) 和 [LICENSING.md](LICENSING.md)。Worker 来源及版权见 [worker/NOTICE.md](worker/NOTICE.md)。公开发布继续遵循继承的许可证。
 
 从早期私有版本迁移到公开历史的部署用户，请先阅读 Windows 文档第 10 节，保留数据和配置，避免强制合并旧历史。
+
+Windows 日常启动可使用根目录 `Start-XianyuIntelligentCs.ps1`，支持右键运行和 PowerShell 命令两种入口，详见 Windows 部署文档第 12 节。
