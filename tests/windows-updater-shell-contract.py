@@ -73,18 +73,20 @@ def main():
             git('commit','--allow-empty','-m','local only',cwd=project);fails_without_build(run())
             git('reset','--hard','origin/main',cwd=project)  # Disposable fixture only.
             lock=project/'.local/windows-update.lock'
-            held=subprocess.Popen([shutil.which('flock') or str(binary/'flock'),str(lock),'sleep','10'])
+            held=subprocess.Popen([sys.executable,'-c',
+                "import fcntl,sys,time; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); time.sleep(10)",str(lock)],stdout=subprocess.PIPE,text=True)
             try:
-                import time
-                time.sleep(.15)
+                assert held.stdout.readline().strip()=='ready'
                 fails_without_build(run())
-            finally:held.terminate();held.wait()
+            finally:
+                held.terminate();held.wait();held.stdout.close()
             # Allowed remote unavailable: no build and no false success.
             moved=root/'offline.git';remote.rename(moved)
             try:fails_without_build(run())
             finally:moved.rename(remote)
             publish('broken-build',True)
             result=run();assert result.returncode!=0;assert '__XIANYU_URL__=' not in result.stdout
+            assert trace.exists(),(result.stdout,result.stderr)
             assert trace.read_text()=='broken-build:start\n'
         finally:server.shutdown();server.server_close();thread.join()
     print('Windows updater: fast-forward, latest script execution, preserved private files, repeated update, dirty/detached/ahead/wrong-origin/concurrent/offline/build-failure guards passed')
