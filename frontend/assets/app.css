@@ -148,7 +148,7 @@
 
 @font-face {
   font-family: "Whale UI";
-  src: url("/xianyu-intelligent-cs/assets/ui-sans-generated.woff2?v=20261026-01") format("woff2");
+  src: url("/xianyu-intelligent-cs/assets/ui-sans-generated.woff2?v=20261026-02") format("woff2");
   font-style: normal;
   font-weight: 100 900;
   font-display: swap;
@@ -4254,3 +4254,11 @@ select { min-height: 34px; padding: 6px 8px; }
 .customer-catalog-progress { margin-bottom: 16px; }
 .customer-catalog-progress progress { width: 100%; height: 12px; accent-color: var(--amber); }
 .customer-catalog-account-progress { flex-basis: 100%; overflow-wrap: anywhere; }
+
+/* Advanced catalog queries remain available without crowding daily actions. */
+.catalog-more-actions { position: relative; }
+.catalog-more-actions > summary { list-style: none; cursor: pointer; }
+.catalog-more-actions > summary::-webkit-details-marker { display: none; }
+.catalog-more-menu { position: absolute; right: 0; top: calc(100% + 8px); z-index: 20; width: min(300px, 80vw); padding: 16px; background: var(--surface, #fff); border: 1px solid var(--line, #e5e7eb); border-radius: 14px; box-shadow: 0 8px 24px #00000014; }
+.catalog-more-menu .button { width: 100%; }
+.catalog-more-menu .field-hint { margin: 10px 0 0; }

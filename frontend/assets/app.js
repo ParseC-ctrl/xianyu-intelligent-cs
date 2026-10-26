@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-intelligent-cs";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20261026-01";
+  const ASSET_VERSION = "20261026-02";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -1802,10 +1802,11 @@
     const nextBatch = $("#customerCatalogNextBatch");
     if (nextBatch) { nextBatch.hidden = catalog.paused === true || remaining <= 0; nextBatch.disabled = busy || catalog.pauseSaving; }
     const pause = $("#customerCatalogPause");
-    if (pause) { pause.hidden = catalog.paused === true; pause.disabled = catalog.pauseSaving || catalog.paused !== false; setBusy(pause, catalog.pauseSaving); }
+    if (pause) { pause.hidden = !busy || catalog.paused === true; pause.disabled = catalog.pauseSaving || catalog.paused !== false; setBusy(pause, catalog.pauseSaving); }
     const resume = $("#customerCatalogResume");
     if (resume) { resume.hidden = catalog.paused !== true; resume.disabled = busy || catalog.pauseSaving; }
-    text("#customerCatalogPausedStatus", catalog.paused === true ? "同步已暂停，定期任务也不会自动补资料。点击继续同步只处理一批。" : "每批最多查询 20 件详情，仅同步新增或变更资料。剩余商品需手动继续下一批；失败商品请单件刷新。");
+    text("#customerCatalogPausedStatus", catalog.paused === true ? "同步已暂停。点击继续同步只处理一批。" : "每批最多查询 20 件详情，仅同步新增或变更资料。剩余商品需手动继续下一批；失败商品请单件刷新。");
+    $("#customerCatalogRefresh").hidden = !catalog.error;
     $("#customerCatalogRefresh").disabled = Boolean(catalog.loading || catalog.jobChecking);
   }
 
@@ -2003,7 +2004,7 @@
 
   function renderCustomerCatalogSettings() {
     const card = $("#customerCatalogSettingsCard"); if (!card) return;
-    card.hidden = !state.customerServiceOnly || !isPlatformAdmin(); if (card.hidden) return;
+    card.hidden = true; if (state.customerServiceOnly || !isPlatformAdmin()) return;
     const catalog = state.ai.catalog;
     const busy = Boolean(catalog.settingsLoading || catalog.settingsSaving);
     $$("#customerCatalogSettingsForm input, #customerCatalogSettingsForm select, #customerCatalogSettingsForm button").forEach((node) => { node.disabled = busy || !catalog.settings; });
@@ -2015,6 +2016,7 @@
   }
 
   async function loadCustomerCatalogSettings(context = captureAccountContext()) {
+    if (state.customerServiceOnly) return;
     const catalog = state.ai.catalog;
     if (!state.customerServiceOnly || !isPlatformAdmin() || !accountContextMatches(context) || catalog.settings) return;
     if (catalog.settingsLoading) return catalog.settingsLoading;
@@ -3142,8 +3144,8 @@
       },
     };
     if (state.customerServiceOnly) {
-      Object.assign(copy.unconfigured, { description: "使用闲鱼 App 扫码连接。连接后保持暂停，需要在客服工作台手动启动。", hint: "商品变更后，请手动更新商品关联。" });
-      Object.assign(copy.connected, { title: "闲鱼账号已连接", description: "商品变更后，请手动更新商品关联；上架与编辑在闲鱼手机 App 完成。", button: "重新扫码连接", hint: "扫码后保持暂停，需要在客服工作台手动启动。" });
+      Object.assign(copy.unconfigured, { description: "使用闲鱼 App 扫码连接。连接后保持暂停，需要在客服工作台手动启动。", hint: "商品变更后，请到商品资料页手动同步。" });
+      Object.assign(copy.connected, { title: "闲鱼账号已连接", description: "商品变更后，请到商品资料页手动同步；上架与编辑在闲鱼手机 App 完成。", button: "重新扫码连接", hint: "扫码后保持暂停，需要在客服工作台手动启动。" });
       Object.assign(copy.reauth_required, { description: "当前登录会话已失效，请使用闲鱼 App 重新扫码。扫码后保持暂停，需要在客服工作台手动启动。", hint: "扫码和确认只在闲鱼官方页面完成。" });
       if (/自动恢复/.test(cookie.action)) cookie.action = "重新扫码连接后，在客服工作台手动启动。";
     }
@@ -4310,7 +4312,7 @@
     document.body.classList.toggle("customer-service-only", state.customerServiceOnly);
     $$("[data-customer-only]").forEach((node) => { node.hidden = !state.customerServiceOnly; });
     $$("[data-customer-admin-only]").forEach((node) => { node.hidden = !state.customerServiceOnly || !isPlatformAdmin(); });
-    const hidden = ".sidebar-bottom [data-view], .version-badge-container, [data-panel=shops] .shops-main, [data-panel=shops] .page-head-actions, #checkCookieButton, #manualReplyInput, #manualReplyFile, #manualReplyDropzone, #manualReplySend, #replyMessage, #quickRepliesBar, #quickRepliesDialog, .ai-knowledge-card, .ai-test-console, #aiStoreForm .ai-form-section:nth-child(2), #aiOpenTemplates, #settingsDocsBtn";
+    const hidden = "#customerSyncProducts, #customerPause, #customerCatalogSettingsCard, [data-panel=chat] .sub-tabs-bar, [data-panel=ai-config] .sub-tabs-bar, .sidebar-bottom [data-view], .version-badge-container, [data-panel=shops] .shops-main, [data-panel=shops] .page-head-actions, #checkCookieButton, #manualReplyInput, #manualReplyFile, #manualReplyDropzone, #manualReplySend, #replyMessage, #quickRepliesBar, #quickRepliesDialog, .ai-knowledge-card, .ai-test-console, #aiStoreForm .ai-form-section:nth-child(2), #aiOpenTemplates, #settingsDocsBtn";
     $$(hidden).forEach((node) => node.toggleAttribute("data-customer-hidden", state.customerServiceOnly));
     $$("[data-view]").forEach((node) => {
       if (!node.classList.contains("sidebar-logo") && !CUSTOMER_VIEWS.has(node.dataset.view)) node.toggleAttribute("data-customer-hidden", state.customerServiceOnly);
@@ -4373,16 +4375,17 @@
     const shopName = String(account?.name || bot.shop_name || (connected ? "已连接闲鱼店铺" : "未连接店铺"));
     const count = state.products.length || view.productCount;
     const lastSync = bot.last_sync_at || (state.products[0] && state.products[0].updated_at);
-    const statusLabel = view.restricted ? "部分能力受限" : connected ? (cookieStatus.label || "已验证") : cookieStatus.label || "需要处理";
+    const statusLabel = view.restricted ? "部分能力受限" : connected ? (state.customerServiceOnly ? (bot.running ? "账号已连接 · 客服运行中" : "账号已连接 · 客服未启动") : (cookieStatus.label || "已验证")) : cookieStatus.label || "需要处理";
     const statusClass = connected && !view.restricted ? "badge-green" : ["risk_control", "risk_cooldown"].includes(syncStatus) ? "badge-amber" : COOKIE_BLOCKING_CODES.has(syncStatus) || view.restricted ? "badge-red" : "badge-muted";
     text("#shopAccountValue", shopName);
-    text("#shopCookieState", connected ? "已验证" : statusLabel);
+    text("#shopCookieState", connected ? "已连接" : statusLabel);
     text("#shopProductState", count ? count + " 个商品" : view.catalog === "empty" ? "暂无在售商品" : view.catalog === "blocked" ? "平台限制中" : view.connection === "checking" ? "正在整理" : "等待检测");
     text("#shopLastSync", lastSync ? formatDate(lastSync) : "--");
     const renewal = bot.auth_renewal || {};
     const renewalTime = (value) => Number.isFinite(Number(value)) && Number(value) > 0 ? formatDate(new Date(Number(value) * 1000).toISOString()) : "";
     const renewalErrors = { cookie_expired: "登录已失效，需要重新扫码", session_expired: "登录已失效，需要重新扫码", cookie_invalid: "登录凭证无效，需要重新扫码", cookie_incomplete: "登录凭证不完整，需要重新扫码", risk_control: "平台风控，已暂停自动尝试", verification_required: "平台要求安全验证", account_restricted: "账号受限，请在闲鱼 App 检查", network_error: "网络异常，等待退避重试", platform_busy: "平台繁忙，等待退避重试", timeout: "请求超时，等待退避重试", token_unavailable: "暂未获得消息令牌", response_invalid: "续期响应无效" };
     const renewalCode = String(renewal.failure_code || "ok");
+    text("#shopLastAuthorization", renewalTime(bot.last_authorized_at) || "暂无授权时间记录");
     text("#shopLastRenewal", renewalTime(renewal.last_success_at) || "暂无成功续期记录");
     text("#shopNextRenewalLabel", renewalCode !== "ok" && !renewal.paused ? "下次计划重试" : "下次计划续期");
     const nextRenewal = renewalTime(renewal.next_attempt_at);

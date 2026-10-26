@@ -381,6 +381,7 @@ def main() -> None:
                                      account=failed_account)
         assert app._read_auth_status(user_id, "failed-shop")["code"] == "ok"
         assert app._read_auth_status(user_id, "failed-shop")["reauthorization_required"] is False
+        assert json.loads(app.read_secret(user_id, "connection_receipt.json", "failed-shop"))["authorized_at"] > 0
 
         failing_accounts.add("failed-shop")
         failed_cookie = "unb=610002; _m_h5_tk=failed-token_tail; sid=failed"

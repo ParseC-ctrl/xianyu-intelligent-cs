@@ -59,27 +59,36 @@ def main():
         assert client.get("/api/bot/catalog").json()["paused"] is False
         assert client.post("/api/bot/catalog/sync", json={"item_ids": ["../other"]}, headers=headers).status_code == 400
         account_for_schedule = app.db.get_shop_account(1, account_key="default")
-        scheduled = client.put("/api/bot/catalog/settings", json={"enabled": True, "interval_hours": 6}, headers=headers)
-        assert scheduled.status_code == 200
-        assert client.put("/api/bot/catalog/settings", json={"enabled": True, "interval_hours": 7}, headers=headers).status_code == 400
-        assert client.put("/api/bot/catalog/settings", json={"enabled": True, "interval_hours": 6, "cookies": "not-accepted"}, headers=headers).status_code == 422
-        schedule_row = {"user_id": 1, "account_id": account_for_schedule["id"], "desired_state": "running"}
-        with patch.object(app.db, "list_worker_runtimes", return_value=[schedule_row]), patch.object(app, "_enqueue_catalog_sync") as enqueue:
-            app._catalog_schedule_once(now=time.time())
-            enqueue.assert_not_called()
-            app._catalog_schedule_once(now=time.time() + 7 * 3600)
-            enqueue.assert_called_once()
-        with patch.object(app.db, "list_worker_runtimes", return_value=[{**schedule_row, "desired_state": "stopped"}]), patch.object(app, "_enqueue_catalog_sync") as enqueue:
+        blocked = client.put("/api/bot/catalog/settings", json={"enabled": True, "interval_hours": 6}, headers=headers)
+        assert blocked.status_code == 409
+        app.write_secret(1, "catalog_sync_settings.json", json.dumps({"enabled": True, "interval_hours": 6, "last_enqueued_at": 1}), "default")
+        assert client.get("/api/bot/catalog/settings").json()["settings"]["enabled"] is False
+        with patch.object(app, "_enqueue_catalog_sync") as enqueue:
             app._catalog_schedule_once(now=time.time() + 7 * 3600)
             enqueue.assert_not_called()
-        assert client.post("/api/bot/catalog/pause", headers=headers).status_code == 200
-        with patch.object(app.db, "list_worker_runtimes", return_value=[schedule_row]), patch.object(app, "_enqueue_catalog_sync") as enqueue:
-            app._catalog_schedule_once(now=time.time() + 7 * 3600)
-            enqueue.assert_not_called()
-        assert client.post("/api/bot/catalog/resume", headers=headers).status_code == 400
-        with patch.object(app, "is_platform_admin", return_value=False):
-            assert client.get("/api/bot/catalog/settings").status_code == 403
-            assert client.put("/api/bot/catalog/settings", json={"enabled": False, "interval_hours": 24}, headers=headers).status_code == 403
+        app.write_secret(1, "catalog_sync_settings.json", json.dumps({"enabled": False, "interval_hours": 6, "last_enqueued_at": None}), "default")
+        with patch.dict(os.environ, {"SAAS_CUSTOMER_SERVICE_ONLY": "0"}):
+            scheduled = client.put("/api/bot/catalog/settings", json={"enabled": True, "interval_hours": 6}, headers=headers)
+            assert scheduled.status_code == 200
+            assert client.put("/api/bot/catalog/settings", json={"enabled": True, "interval_hours": 7}, headers=headers).status_code == 400
+            assert client.put("/api/bot/catalog/settings", json={"enabled": True, "interval_hours": 6, "cookies": "not-accepted"}, headers=headers).status_code == 422
+            schedule_row = {"user_id": 1, "account_id": account_for_schedule["id"], "desired_state": "running"}
+            with patch.object(app.db, "list_worker_runtimes", return_value=[schedule_row]), patch.object(app, "_enqueue_catalog_sync") as enqueue:
+                app._catalog_schedule_once(now=time.time())
+                enqueue.assert_not_called()
+                app._catalog_schedule_once(now=time.time() + 7 * 3600)
+                enqueue.assert_called_once()
+            with patch.object(app.db, "list_worker_runtimes", return_value=[{**schedule_row, "desired_state": "stopped"}]), patch.object(app, "_enqueue_catalog_sync") as enqueue:
+                app._catalog_schedule_once(now=time.time() + 7 * 3600)
+                enqueue.assert_not_called()
+            assert client.post("/api/bot/catalog/pause", headers=headers).status_code == 200
+            with patch.object(app.db, "list_worker_runtimes", return_value=[schedule_row]), patch.object(app, "_enqueue_catalog_sync") as enqueue:
+                app._catalog_schedule_once(now=time.time() + 7 * 3600)
+                enqueue.assert_not_called()
+            assert client.post("/api/bot/catalog/resume", headers=headers).status_code == 400
+            with patch.object(app, "is_platform_admin", return_value=False):
+                assert client.get("/api/bot/catalog/settings").status_code == 403
+                assert client.put("/api/bot/catalog/settings", json={"enabled": False, "interval_hours": 24}, headers=headers).status_code == 403
         assert client.put("/api/bot/catalog/settings", json={"enabled": False, "interval_hours": 24}, headers=headers).status_code == 200
         # Historical cookie failures must terminate the old browser job lock
         # without declaring the replacement login expired.

@@ -2771,7 +2771,9 @@ def _run_shop_sync_inner(
         # The candidate Cookie has been verified and committed, and the old
         # worker paused. Clearing its stale failure must not depend on starting AI.
         if replace_cookie and code == "verified":
-            _clear_auth_status(uid, str(account["account_key"]) if account is not None else "default")
+            key = str(account["account_key"]) if account is not None else "default"
+            _clear_auth_status(uid, key)
+            write_secret(uid, "connection_receipt.json", json.dumps({"authorized_at": time.time()}), key)
 
     try:
         return run_shop_sync_inner(
@@ -3029,6 +3031,8 @@ def _catalog_account_identity(user_id, account_key):
 
 
 def _catalog_settings(user_id, account_key):
+    if _env_true("SAAS_CUSTOMER_SERVICE_ONLY", "0"):
+        return {"enabled": False, "interval_hours": 24, "last_enqueued_at": None, "manual_only": True}
     raw = read_secret(user_id, "catalog_sync_settings.json", account_key)
     if not raw:
         return {"enabled": False, "interval_hours": 24, "last_enqueued_at": None}
@@ -3207,6 +3211,8 @@ def save_catalog_settings(body: CatalogSettingsIn, user=Depends(Auth.current_use
         raise HTTPException(403, "仅管理员可配置商品定期同步")
     if body.interval_hours not in (6, 12, 24):
         raise HTTPException(400, "同步间隔请选择6、12或24小时")
+    if body.enabled and _env_true("SAAS_CUSTOMER_SERVICE_ONLY", "0"):
+        raise HTTPException(409, "当前客服工作台仅支持手动同步商品资料")
     lease, owner = _acquire_account_lease("catalog-enqueue", user, account, lease_seconds=45,
         busy_message="商品同步设置正在保存", unavailable_message="商品同步设置暂时不可用")
     try:
@@ -4022,6 +4028,14 @@ def get_bot_status(
     result["needs_human"] = auth_state["needs_human"]
     result["reauthorization_required"] = auth_state["reauthorization_required"]
     result["auth_updated_at"] = auth_state["updated_at"]
+    result["last_authorized_at"] = None
+    try:
+        receipt = json.loads(read_secret(user["id"], "connection_receipt.json", account_key) or "{}")
+        authorized_at = receipt.get("authorized_at")
+        if type(authorized_at) in (int, float) and 0 < authorized_at <= time.time():
+            result["last_authorized_at"] = authorized_at
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
     # Account-private local status only: no platform probe or token renewal.
     renewal_code = auth_state["code"]
     if renewal_code == "ok" and not auth_state.get("last_renewed_at") and result["account"]["last_error_code"] in {"cookie_expired", "cookie_invalid", "cookie_incomplete", "session_expired", "risk_control", "verification_required", "account_restricted"}:
@@ -7528,7 +7542,7 @@ _catalog_schedule_stop = threading.Event()
 
 
 def _catalog_schedule_once(now=None):
-    if maintenance_active():
+    if _env_true("SAAS_CUSTOMER_SERVICE_ONLY", "0") or maintenance_active():
         return
     from shop_sync import check_sync_circuit, PERSISTED_SYNC_CODES
     try:
