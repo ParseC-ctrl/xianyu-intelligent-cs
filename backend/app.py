@@ -2766,13 +2766,20 @@ def _run_shop_sync_inner(
     before_replace_persist=None,
     connection_lease=None,
 ) -> dict:
+    def persist_verified_state(uid, code, snapshot, account=None):
+        _sync_account_state(uid, code, snapshot, account=account)
+        # The candidate Cookie has been verified and committed, and the old
+        # worker paused. Clearing its stale failure must not depend on starting AI.
+        if replace_cookie and code == "verified":
+            _clear_auth_status(uid, str(account["account_key"]) if account is not None else "default")
+
     try:
         return run_shop_sync_inner(
             db=db,
             read_secret=read_secret,
             write_secret=write_secret,
             load_verified_snapshot=load_verified_snapshot,
-            sync_account_state=_sync_account_state,
+            sync_account_state=persist_verified_state,
             user_id=user_id,
             cookie_header=cookie_header,
             replace_cookie=replace_cookie,

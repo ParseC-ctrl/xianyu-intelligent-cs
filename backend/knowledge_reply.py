@@ -13,7 +13,7 @@ import unicodedata
 from typing import Callable
 
 from material_knowledge import knowledge_text_safe
-from reply_style import recent_replies, repetitive, no_bargaining, grounded_fallback, repeated_price_phrase, buyer_facing_text, acknowledgement_choices
+from reply_style import recent_replies, repetitive, no_bargaining, grounded_fallback, repeated_price_phrase, buyer_facing_text, acknowledgement_choices, explicit_policy_price
 
 FIELD_LABELS = {"upper": "鞋面", "lining": "内里", "insole": "鞋垫", "sole": "鞋底"}
 INTENTS = {"greeting", "ack", "material", "faq", "business_human", "human", "unclear", "other", "platform_contact", "purchase", "social", "comfort", "overview"}
@@ -439,8 +439,15 @@ def _natural_answer(model_call, result, message, history, revision=""):
             offer = re.search(r"(?:可以|能|给你|给您|帮你|帮您).{0,5}(?:优惠|便宜|降价|打折|改价|少点|让价)|(?:优惠|便宜|少点|打折).{0,3}(?:可以|没问题)", clause)
             if offer and not re.search(r"不能|不可以|没法|没有|不再|没办法|不支持|不了", clause):
                 raise ReplyGenerationError("unsupported_claim")
-        explicit_policy = re.search(r"(?:不|没法|不能|没办法|没有).{0,5}(?:议价|刀|优惠|便宜|少|降|让|调整)|(?:按|就是|就按|还是).{0,5}(?:标价|页面价)|价格.{0,5}(?:固定|不变)|让不了|少不了", text)
+        explicit_policy = re.search(r"一口价|(?:不|没法|不能|没办法|没有).{0,5}(?:议价|刀|优惠|便宜|少|降|让|调整)|(?:按|就是|就按|还是).{0,5}(?:标价|页面价)|价格.{0,5}(?:固定|不变)|让不了|少不了", text)
         contextual_refusal = (recent_replies(history) and re.search(r"不行|不可以|没办法|让不了|少不了|真不能|确实不能|价(?:格|钱).{0,5}(?:不动|不改|固定|就这样)", text))
+        price = explicit_policy_price(source)
+        if price:
+            if re.search(r"标价|页面价|页面的价格|按页面", text) and not re.search(r"标价|页面", source):
+                raise ReplyGenerationError("quoted_price_missing")
+            previously_quoted = any(price in old for old in recent_replies(history))
+            if price not in text and not previously_quoted:
+                raise ReplyGenerationError("quoted_price_missing")
         if not explicit_policy and not contextual_refusal:
             raise ReplyGenerationError("negotiation_policy_missing")
         if repetitive(text, recent_replies(history)):
@@ -498,6 +505,7 @@ def answer_material_question(store, *, message: str, facts: dict | None,
                             "known_type_reasked": "买家已说明平时鞋类型和尺码。直接承接这些信息，不再询问另一种鞋的码数；无法确认就说需核对鞋内长。",
                             "new_numbers": "上一稿加入了依据之外的数字，请删除。",
                             "material_changed": "上一稿改动或遗漏了材质原文，请完整保留。",
+                            "quoted_price_missing": "请保留已审核答案中的明确金额，首次询价要报出该金额，不要改成按页面标价。",
                             "negotiation_policy_missing": "上一稿未清楚保留不议价政策，请明确表达价格不调整。",
                             "unsupported_claim": "上一稿含未提供的事实或承诺，请严格依据资料。"}.get(fallback_reason, "请严格依据资料重新组织语言。")
                 continue

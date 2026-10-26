@@ -371,6 +371,17 @@ def main() -> None:
                 assert shown["title"] == shop_sync.SYNC_STATUS_CATALOG[code]["label"]
                 assert shown["message"] == shop_sync.SYNC_STATUS_CATALOG[code]["message"]
 
+        # A verified replacement clears stale worker auth even when AI is
+        # explicitly stopped in the dedicated customer-service deployment.
+        app.write_secret(user_id, "auth_status.json", json.dumps({
+            "code": "session_expired", "reauthorization_required": True,
+            "needs_human": True, "phase": "NEEDS_HUMAN"}), "failed-shop")
+        with patch.dict(os.environ, {"SAAS_KNOWLEDGE_ONLY": "1"}):
+            app._run_shop_sync_inner(user_id, "unb=610002; _m_h5_tk=fresh_9999999999999", True,
+                                     account=failed_account)
+        assert app._read_auth_status(user_id, "failed-shop")["code"] == "ok"
+        assert app._read_auth_status(user_id, "failed-shop")["reauthorization_required"] is False
+
         failing_accounts.add("failed-shop")
         failed_cookie = "unb=610002; _m_h5_tk=failed-token_tail; sid=failed"
         failed = client.put(

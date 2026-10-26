@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-intelligent-cs";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20261023-01";
+  const ASSET_VERSION = "20261026-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -3471,6 +3471,8 @@
 
   async function finishQrLogin(generation, completed = null) {
     if (state.qrLogin.generation !== generation) return;
+    // Fence status requests started before this fresh authorization.
+    state.accountEpoch += 1;
     state.qrLogin.status = "connected";
     state.qrLogin.message = "";
     renderQrLogin();

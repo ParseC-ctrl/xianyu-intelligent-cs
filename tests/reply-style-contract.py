@@ -148,4 +148,29 @@ class ReplyStyleContracts(unittest.TestCase):
         self.assertEqual(result['reason_code'], 'knowledge_changed')
 
 
+class FixedPriceContracts(unittest.TestCase):
+    def test_outage_fallback_keeps_private_policy_amount(self):
+        result = {'reason_code': 'faq_answered', 'reply': '统一126元一口价，不再议价。'}
+        history = []
+        for _ in range(8):
+            reply = grounded_fallback(result, history, '最低多少')
+            self.assertIn('126元', reply)
+            self.assertNotIn('标价', reply)
+            self.assertNotIn('页面', reply)
+            history.append({'role': 'assistant', 'content': reply})
+
+    def test_model_must_quote_reviewed_price(self):
+        class PriceStore(Store):
+            def get_faqs(self):
+                return [{'id': 'price', 'question': '最低多少钱', 'topics': ['最低多少'],
+                         'answer': '统一126元一口价，不再议价。', 'enabled': True}]
+        def model(messages):
+            data = json.loads(messages[-1]['content'])
+            if 'verified_answer' not in data: return classify()
+            return json.dumps({'reply': '按页面标价出，不刀哈。'}, ensure_ascii=False)
+        result = answer_material_question(PriceStore(), message='最低多少', facts=None, model_call=model)
+        self.assertIn('126元', result['reply'])
+        self.assertNotIn('标价', result['reply'])
+
+
 if __name__ == '__main__': unittest.main()
