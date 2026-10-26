@@ -36,6 +36,15 @@ def main():
         with patch.object(sys,'argv',['sync','--configure','--source',str(source),'--credentials',str(credentials)]):sync.main()
         assert json.loads(sync.CONFIG.read_text())['source']==str(source)
         assert sync.CONFIG.stat().st_mode & 0o077 == 0
+        # Changing the authoritative source must retain credentials and origin.
+        before=json.loads(sync.CONFIG.read_text())
+        with patch.object(sys,'argv',['sync','--configure','--source',str(source),'--account','second']):sync.main()
+        after=json.loads(sync.CONFIG.read_text())
+        assert after['account']=='second' and after['credentials']==before['credentials'] and after['origin']==before['origin']
+        with patch.object(sys,'argv',['sync','--configure','--source',str(source)]):sync.main()
+        assert json.loads(sync.CONFIG.read_text())['account']=='second'
+        with patch.object(sys,'argv',['sync','--configure','--source',str(source),'--account','default']):sync.main()
+
         class Ready(io.BytesIO):status=200
         with patch.object(sync.urllib.request,'build_opener') as opener, patch.object(sync.subprocess,'run') as run:
             opener.return_value.open.side_effect=lambda *a,**k:Ready(b'{}')

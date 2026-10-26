@@ -159,6 +159,12 @@ class FixedPriceContracts(unittest.TestCase):
             self.assertNotIn('页面', reply)
             history.append({'role': 'assistant', 'content': reply})
 
+    def test_fallback_keeps_additional_reviewed_policy_facts(self):
+        source = '品牌统一126元一口价，不议价。接待人员没有调整价格权限。'
+        result = {'reason_code': 'faq_answered', 'reply': source}
+        self.assertEqual(grounded_fallback(result, [], '最低多少'), source)
+        self.assertEqual(grounded_fallback(result, [{'role': 'assistant', 'content': source}], '再少点'), source)
+
     def test_model_must_quote_reviewed_price(self):
         class PriceStore(Store):
             def get_faqs(self):

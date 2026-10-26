@@ -4,6 +4,8 @@ param(
     [string]$Distro = '',
     [string]$ProjectPath = '',
     [string]$WslUser = '',
+    [string]$FaqSource = '',
+    [string]$AccountKey = '',
     [switch]$Build,
     [switch]$Update,
     [switch]$NoBrowser,
@@ -67,6 +69,8 @@ export DOCKER_HOST=unix:///var/run/docker.sock
 unset DOCKER_CONTEXT
 project="$(printf %s "$project_encoded" | base64 -d)"
 action="$(printf %s "$action_encoded" | base64 -d)"
+faq_source="$(printf %s "${faq_source_encoded:-}" | base64 -d)"
+faq_account="$(printf %s "${faq_account_encoded:-}" | base64 -d)"
 if ! docker info >/dev/null 2>&1; then
     echo 'Docker is running but this WSL user cannot access its socket. Use the original deployment user or fix docker group membership.' >&2
     exit 1
@@ -107,6 +111,13 @@ cd -- "$project"
 project="$PWD"
 command -v python3 >/dev/null || { echo 'python3 is required inside WSL.' >&2; exit 1; }
 if [[ "$action" == update ]]; then
+    if [[ -n "$faq_source" ]]; then
+        if [[ "$faq_source" != /* ]]; then
+            command -v wslpath >/dev/null || { echo 'wslpath is required to locate the private FAQ source.' >&2; exit 1; }
+            faq_source="$(wslpath -a "$faq_source")"
+        fi
+        [[ -f "$faq_source" && -r "$faq_source" ]] || { echo 'Private FAQ source is not readable inside WSL. Check the source path and drive mount.' >&2; exit 1; }
+    fi
     command -v git >/dev/null || { echo 'git is required inside WSL for updating.' >&2; exit 1; }
     command -v flock >/dev/null || { echo 'flock (util-linux) is required for safe updates.' >&2; exit 1; }
     mkdir -p .local
@@ -140,6 +151,12 @@ p=Path('.local/windows-update.json')
 p.write_text(json.dumps({'previous_revision':sys.argv[1],'target_revision':sys.argv[2],'started_at':time.time()}))
 p.chmod(0o600)
 PYRECORD
+    if [[ -n "$faq_source" ]]; then
+        faq_args=(--configure --source "$faq_source")
+        if [[ -n "$faq_account" ]]; then faq_args+=(--account "$faq_account"); fi
+        python3 scripts/sync-local-faqs.py "${faq_args[@]}"
+        python3 scripts/sync-local-faqs.py --validate
+    fi
     action=start
 fi
 echo "Starting existing deployment: $project"
@@ -176,6 +193,8 @@ printf '__XIANYU_PROJECT__=%s\n' "$project"
 '@
 
 try {
+    if (($FaqSource -or $AccountKey) -and -not $Update) { throw 'Private FAQ source parameters require -Update.' }
+    if ($AccountKey -and -not $FaqSource) { throw 'Specify -FaqSource together with -AccountKey.' }
     Get-Command wsl.exe -ErrorAction Stop | Out-Null
     if (Test-Path -LiteralPath $SettingsPath) {
         $Saved = Get-Content -LiteralPath $SettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -203,7 +222,7 @@ try {
     $Action = 'run'
     if ($Build) { $Action = 'start' }
     if ($Update) { $Action = 'update' }
-    $Parameters = "project_encoded='$(Encode-Text $ProjectPath)'`naction_encoded='$(Encode-Text $Action)'`n"
+    $Parameters = "project_encoded='$(Encode-Text $ProjectPath)'`naction_encoded='$(Encode-Text $Action)'`nfaq_source_encoded='$(Encode-Text $FaqSource)'`nfaq_account_encoded='$(Encode-Text $AccountKey)'`n"
     Invoke-WslScript ($Parameters + $ServiceScript) $WslUser
     if (-not $script:ServiceUrl -or -not $script:ResolvedProject) { throw 'Startup did not report a ready service.' }
     $SettingsDir = Split-Path -Parent $SettingsPath

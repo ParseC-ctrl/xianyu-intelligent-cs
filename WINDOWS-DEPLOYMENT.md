@@ -365,3 +365,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\Deskto
 遇到代码未提交、分支不是 main、本地存在额外提交、远程仓库不符、网络错误或同时运行另一更新任务时停止；不执行强制覆盖、删库、卷删除、密钥初始化或管理员重置。未跟踪及忽略的配置保留；未跟踪文件与新源码冲突时 Git 会停止合并，需要自行整理。构建失败时不会因为构建步骤主动停止原有容器；构建完成进入容器切换后若检查失败，应查看本地错误及容器状态，不能视为更新成功。
 
 `.local/windows-update.json` 记录本次更新前和目标提交，供排错使用，不是自动回滚承诺。更新会短暂重建服务；已有运行的客服可能按其原有运行意图恢复，未启用的客服不会因该脚本自动启用。脚本不扫码、不做商品同步或模型试答。重要更新前仍建议按原部署方式备份数据卷和私有配置。Windows WSL 实机的最终部署效果需要用户验收。
+
+
+### 更新时明确指定私有 FAQ 文件
+
+`Update-XianyuIntelligentCs.ps1` 和 `Start-XianyuIntelligentCs.ps1 -Update` 支持 `-FaqSource` 指定 Windows 或 WSL 内的绝对文件路径。Windows 盘符路径会经 `wslpath` 转换；对应盘符或共享目录必须已经能在 WSL 读取，否则更新入口报告失败，不构建容器。
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\项目目录\Update-XianyuIntelligentCs.ps1" -FaqSource "D:\项目目录\deployment-assets\customer-faq-updates.json" -AccountKey "default" -NoPause
+```
+
+这会在拉取代码后、构建之前配置并校验私有同步源，复用 WSL 原有 `.local/faq-sync.json` 的凭据位置、端口和账号；显式指定 `-AccountKey` 时只调整目标账号。首次没有配置时使用已有 `.local/windows-admin.json` 凭据及默认账号。不会创建或重置管理员。源文件需要存在且格式有效；导入会按 ID 合并、保留其他问答并备份变化前的 FAQ。
+
+针对具体店铺的话术和专用更新入口只通过本地私有 `deployment-assets` 交付，不能依赖 Git 拉取获得。运行私有入口时请保留该目录与主目录脚本的相对位置，并使用当前共享目录中的最新版脚本；单独复制一份旧 FAQ 到别处不会自动获得后续更新。公开仓库、Release 和 CI 中不包含真实店铺政策。

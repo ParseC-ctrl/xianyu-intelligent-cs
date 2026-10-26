@@ -29,6 +29,7 @@ def main():
         def app_script(label,fail=False):
             return '#!/bin/bash\ncase "$1" in\nstart|run) echo "'+label+':$1" >> "$TRACE"; '+('exit 9' if fail else ':')+';;\nstatus) :;;\nesac\n'
         (author/'scripts/customer.sh').write_text(app_script('old'))
+        (author/'scripts/sync-local-faqs.py').write_text("import os,sys\nfrom pathlib import Path\nif os.getenv('FAIL_FAQ_CONFIG'):sys.exit(3)\nif '--source' in sys.argv:assert Path(sys.argv[sys.argv.index('--source')+1]).is_file()\nwith Path(os.environ['TRACE']).open('a') as f:f.write('faq-validated\\n' if '--validate' in sys.argv else 'faq-configured\\n')\n")
         git('add','.',cwd=author);git('commit','-m','initial',cwd=author);git('remote','add','origin',remote,cwd=author);git('push','-u','origin','main',cwd=author)
         git('clone','--branch','main',remote,project);identity(project)
         (project/'config').mkdir();(project/'private-note.txt').write_text('preserve untracked')
@@ -47,9 +48,10 @@ def main():
         original_env=(project/'config/customer.env').read_bytes()
         # Only the allowed-origin pattern changes in this extracted test copy.
         body=service.replace('https://github.com/ParseC-ctrl/xianyu-intelligent-cs.git|',str(remote)+'|',1)
-        def run():
+        def run(faq_source="",account="",extra=None):
             prefix="project_encoded='"+base64.b64encode(str(project).encode()).decode()+"'\naction_encoded='dXBkYXRl'\n"
-            return subprocess.run(['bash'],input=prefix+body,text=True,capture_output=True,env={**os.environ,'PATH':str(binary)+os.pathsep+os.environ['PATH'],'TRACE':str(trace),'GIT_CONFIG_NOSYSTEM':'1'})
+            prefix+="faq_source_encoded='"+base64.b64encode(faq_source.encode()).decode()+"'\nfaq_account_encoded='"+base64.b64encode(account.encode()).decode()+"'\n"
+            return subprocess.run(['bash'],input=prefix+body,text=True,capture_output=True,env={**os.environ,'PATH':str(binary)+os.pathsep+os.environ['PATH'],'TRACE':str(trace),'GIT_CONFIG_NOSYSTEM':'1',**(extra or {})})
         def publish(label,fail=False):
             (author/'scripts/customer.sh').write_text(app_script(label,fail))
             git('add','.',cwd=author);git('commit','-m',label,cwd=author);git('push','origin','main',cwd=author)
@@ -66,6 +68,14 @@ def main():
             assert (project/'private-note.txt').read_text()=='preserve untracked'
             result=run();assert result.returncode==0;assert trace.read_text().count('new:start')==2
             trace.unlink()
+            private_source=root/"private FAQ ' quote.json";private_source.write_text('{}')
+            wslpath=binary/'wslpath';wslpath.write_text('#!'+sys.executable+'\nimport os\nprint(os.environ["WSL_SOURCE"])\n');wslpath.chmod(0o755)
+            result=run(r"C:\private folder ' quote\faqs.json",'fixture-account',{'WSL_SOURCE':str(private_source)})
+            assert result.returncode==0,(result.stdout,result.stderr)
+            assert trace.read_text()=='faq-configured\nfaq-validated\nnew:start\n'
+            trace.unlink()
+            fails_without_build(run(str(root/'missing-private-source')))
+            fails_without_build(run(str(private_source),extra={'FAIL_FAQ_CONFIG':'1'}))
             with (project/'compose.customer.yml').open('a') as f:f.write('# local change\n')
             fails_without_build(run());git('restore','compose.customer.yml',cwd=project)
             git('checkout','--detach',cwd=project);fails_without_build(run());git('checkout','main',cwd=project)

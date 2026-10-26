@@ -4,6 +4,8 @@ param(
     [string]$Distro = '',
     [string]$ProjectPath = '',
     [string]$WslUser = '',
+    [string]$FaqSource = '',
+    [string]$AccountKey = '',
     [switch]$NoBrowser,
     [switch]$NoPause
 )

@@ -76,6 +76,10 @@ def grounded_fallback(result, history, message=""):
         return source
     choices = []
     if result.get('reason_code') == 'faq_answered' and no_bargaining(source):
+        # Additional reviewed policy facts must survive model outages. Generic
+        # price-only variants cannot preserve company/brand/authority details.
+        if re.search(r'公司|品牌|权限', source):
+            return source
         choices = [
             '这双不刀，按标价出。',
             '价格就按页面的，没法再少啦。',

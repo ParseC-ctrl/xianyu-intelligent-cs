@@ -88,15 +88,18 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--configure',action='store_true')
     parser.add_argument('--source',type=Path)
-    parser.add_argument('--credentials',type=Path,default=ROOT/'.local/windows-admin.json')
-    parser.add_argument('--account',default='default')
+    parser.add_argument('--credentials',type=Path)
+    parser.add_argument('--account')
     parser.add_argument('--origin')
     parser.add_argument('--validate',action='store_true')
     args=parser.parse_args()
     if args.configure:
         if not args.source:parser.error('--source required for initial setup')
-        config={'source':str(args.source.expanduser().resolve()),'credentials':str(args.credentials.expanduser().resolve()),
-                'account':args.account,'origin':args.origin or default_origin()}
+        previous=json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+        credentials=args.credentials or Path(previous.get('credentials',ROOT/'.local/windows-admin.json'))
+        config={'source':str(args.source.expanduser().resolve()),'credentials':str(credentials.expanduser().resolve()),
+                'account':args.account or previous.get('account','default'),
+                'origin':args.origin or previous.get('origin') or default_origin()}
         validate(config);atomic_json(CONFIG,config)
         print('Private FAQ deployment synchronization configured; no server data changed')
         return
