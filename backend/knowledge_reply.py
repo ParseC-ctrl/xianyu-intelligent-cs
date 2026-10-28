@@ -485,6 +485,14 @@ def _natural_answer(model_call, result, message, history, revision=""):
             raise ReplyGenerationError("recent_duplicate")
         if repeated_price_phrase(text, recent_replies(history)):
             raise ReplyGenerationError("repeated_price_phrase")
+    if result.get("size_guidance"):
+        labels = re.findall(r"标准(?:皮鞋|运动鞋)码", source)
+        if labels and not any(label in old for old in recent_replies(history) for label in labels) and not any(label in text for label in labels):
+            raise ReplyGenerationError("size_guide_missing")
+        # Buyer sizes and guide examples are not evidence of the listing size.
+        claims = re.findall(r"(?:这款|这双|本款)(?:鞋)?(?:的?尺码|的?鞋码|的?码数|的?码)?(?:是|为|有|只有|仅有|可参考|可以参考|穿|选)?\s*(3[0-9](?:\.5)?|4[0-9](?:\.5)?|50)\s*码", text)
+        if any(not result.get("product_size") or claim != result["product_size"] for claim in claims):
+            raise ReplyGenerationError("product_size_mismatch")
     if result.get("size_guidance") and re.search(r"(?:标(?:注)?的是|(?:商品|页面|链接|资料).{0,6}(?:标(?:注|的|明)?|显示|写的))", text):
         raise ReplyGenerationError("size_source_wording")
     if re.search(r"(?:感谢|谢谢).{0,4}理解|见谅|理解你[的这].{0,3}诚意", text):
@@ -530,7 +538,9 @@ def answer_material_question(store, *, message: str, facts: dict | None,
             # A single bounded rewrite for a valid-but-unusable answer; do not
             # multiply requests on network failures or malformed provider JSON.
             if isinstance(error, ReplyGenerationError) and fallback_reason != "invalid_generated_reply" and attempt == 0:
-                revision = {"size_source_wording": "直接说这款是几码，不使用商品标注、链接显示、资料写着等来源话术；保留选码指南。",
+                revision = {"size_guide_missing": "首次回答保留审核指南中的标准码制说明，再结合商品和买家码数。",
+                            "product_size_mismatch": "商品码数只能使用product_size，若为空不要猜；买家码数和FAQ示例不是商品尺码。",
+                            "size_source_wording": "直接说这款是几码，不使用商品标注、链接显示、资料写着等来源话术；保留选码指南。",
                             "stiff_template": "上一稿像客服套话。删掉感谢理解、见谅等客套，用一句日常聊天直接回应。",
                             "repeated_price_phrase": "上一稿重复了最近答复中的价格短句或结尾。不要反复补充同一句标价说明；简短承接当前追问，换句式，保持不降价即可。",
                             "recent_duplicate": "上一稿与最近回复重复。请换句式和回应角度，仍回答同一个问题。",

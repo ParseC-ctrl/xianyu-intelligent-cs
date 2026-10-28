@@ -123,6 +123,27 @@ def main():
 
 
 
+        # A buyer's size or an FAQ example may never become the listing size.
+        def wrong_listing(messages):
+            if "verified_answer" in json.loads(messages[-1]["content"]):
+                return json.dumps({"reply": "这款是41码，标准皮鞋码。"}, ensure_ascii=False)
+            return model("faq", faq_id="size")(messages)
+        for sample_facts in ({"title": "合成鞋43码"}, {"title": "合成鞋"}):
+            rejected = ask("我41码能穿吗", facts=sample_facts, model_call=wrong_listing)
+            assert rejected["reply_method"] == "verified_fallback" and "这款是41码" not in rejected["reply"]
+        def correct_listing(messages):
+            if "verified_answer" in json.loads(messages[-1]["content"]):
+                return json.dumps({"reply": "这款是43码，标准皮鞋码。"}, ensure_ascii=False)
+            return model("faq", faq_id="size")(messages)
+        assert ask("我41码能穿吗", facts={"title": "合成鞋43码"}, model_call=correct_listing)["reply_method"] == "model_grounded"
+
+        def omit_guide(messages):
+            if "verified_answer" in json.loads(messages[-1]["content"]):
+                return json.dumps({"reply": "这款是43码哦。"}, ensure_ascii=False)
+            return model("faq", faq_id="size")(messages)
+        guide_answer = ask("我41码能穿吗", facts={"title": "合成鞋43码"}, model_call=omit_guide)
+        assert guide_answer["reply_method"] == "verified_fallback" and guide_answer["reply"] == size_faq["answer"]
+
         # SKU availability must retain its reviewed policy even after a buyer
         # supplied their own size. Synthetic policy only; no shop data here.
         availability = {"id": "variant", "question": "其他尺码或颜色是否可选；不判断合脚，不提供选码建议。", "topics": ["有其他码数吗"],
