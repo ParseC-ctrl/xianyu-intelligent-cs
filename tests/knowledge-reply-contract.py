@@ -11,7 +11,7 @@ import openpyxl
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 from material_knowledge import MaterialKnowledgeStore
-from knowledge_reply import buyer_size_context, answer_material_question, GREETING_REPLY, OTHER_REPLY, PRODUCT_CLARIFY, INTENT_CLARIFY
+from knowledge_reply import listing_size_fact, buyer_size_context, answer_material_question, GREETING_REPLY, OTHER_REPLY, PRODUCT_CLARIFY, INTENT_CLARIFY
 from ai_customer_service import AIService, AIServiceError
 from shop_sync import extract_product
 
@@ -109,6 +109,48 @@ def main():
         short_answer = ask("皮鞋", history=hist[:2], model_call=model("unclear"))
         assert short_answer["reason_code"] == "faq_answered" and "平时皮鞋40码" in short_answer["reply"]
         assert buyer_size_context(hist[:2], "不是皮鞋")[-1]["shoe_type"] == ""
+
+        # SKU availability must retain its reviewed policy even after a buyer
+        # supplied their own size. Synthetic policy only; no shop data here.
+        availability = {"id": "variant", "question": "其他尺码或颜色是否可选；不判断合脚，不提供选码建议。", "topics": ["有其他码数吗"],
+                        "answer": "合成规格说明：请参考当前选项，其他规格另行查看。", "enabled": True}
+        store.save_faqs([size_faq, availability])
+        availability_context = [{"role": "user", "content": "我平时皮鞋40码"}]
+        captured_variant = []
+        def variant_model(messages):
+            payload = json.loads(messages[-1]["content"])
+            if "verified_answer" in payload:
+                captured_variant.append(payload["verified_answer"])
+                return json.dumps({"reply": availability["answer"]}, ensure_ascii=False)
+            return model("faq", faq_id="variant")(messages)
+        for question in ["有其他码数吗", "那有40码吗", "还有别的颜色吗"]:
+            result = ask(question, history=availability_context, model_call=variant_model)
+            assert_reply(result, "faq_answered")
+            assert result["reply"] == availability["answer"] and result["reply_method"] == "model_grounded"
+            assert captured_variant[-1] == availability["answer"]
+        for details in [{"title": "合成鞋 43码"}, {"description": "尺码：43；颜色：测试色"},
+                        {"description": "４３码"}, {"description": "平时穿42码建议选41码；当前尺码：43"}]:
+            assert listing_size_fact(details) == "43", details
+            for question in ["有什么码", "是43码么？", "是40码么？"]:
+                result = ask(question, facts=details, history=availability_context, model_call=model("listing_size"))
+                assert_reply(result, "listing_size_answered")
+                assert "43码" in result["reply"] and "40" not in result["reply"]
+        for details in [{}, {"description": "平时运动鞋42选41"}, {"title": "43码", "description": "尺码42"},
+                        {"description": "尺码40-43"}, {"description": "没有43码"}, {"description": "货号TEST100-43码"}]:
+            assert listing_size_fact(details) == "", details
+            result = ask("是43码么？", facts=details, history=availability_context, model_call=model("listing_size"))
+            assert_reply(result, "listing_size_unknown")
+            assert "43" not in result["reply"] and "40" not in result["reply"]
+        # Adding a second FAQ that mentions sizes cannot disable short fit
+        # clarification resolution or change its buyer-specific size handling.
+        short_answer = ask("皮鞋", history=hist[:2], model_call=model("unclear"))
+        assert short_answer["faq_id"] == "size" and "平时皮鞋40码" in short_answer["reply"]
+        fit_answer = ask("这个码我能穿吗", history=availability_context, model_call=model("faq", faq_id="size"))
+        assert "平时皮鞋40码" in fit_answer["reply"]
+        assert ask("有其他码数吗", facts=None)["reply"] == availability["answer"]
+        availability["enabled"] = False
+        store.save_faqs([size_faq, availability])
+        assert ask("有其他码数吗", facts=None)["decision"] == "handoff"
 
         store.save_faqs([])
 
