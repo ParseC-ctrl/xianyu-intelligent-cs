@@ -35,7 +35,7 @@ fields必须始终是JSON数组，不能是字符串或null。material时从uppe
 social是购物过程中的寒暄、回来继续聊、笑脸、感谢或情绪表达，如“哈哈我又回来了”；不要判other。议价后的“求求你”“真的不行吗”优先继续议价FAQ。
 comfort是询问脚感、舒适、穿着体验，如“穿起来舒服吗”“平时穿起来感觉如何”，意图已明确，不能unclear；没有试穿资料也可以诚实说明不知道，不能虚构体验。
 overview是介绍这双鞋、还有哪些参数、其他材质等概览请求；不代表索要全部未知属性。材质字段仍必须fields=[]，程序选取实际有的资料。
-尺码FAQ里的“运动鞋42选41”属于通用示例，不是买家尺码。必须记住用户自己提供的尺码及鞋类型，不能用示例覆盖。问“40码能穿41吗”意图明确，选尺码FAQ，不选unclear。
+尺码FAQ里的“运动鞋42选41”属于通用示例，不是买家尺码。必须记住用户自己提供的尺码及鞋类型，不能用示例覆盖。问“40码能穿41吗”“我的脚41码会不会偏大，能不能穿”意图明确，有适用审核FAQ时选尺码FAQ，不选unclear或business_human。选码话题后的“皮鞋”“运动鞋”是补充鞋类型；“你就说可不可以”“到底能不能穿”仍是选码追问，继续选适用尺码FAQ，不当作人工请求或必须保证合脚的业务操作。
 purchase是询问如何在闲鱼正常下单、怎么买、在哪拍；仅说明商品页下单流程，不涉及代操作、改价、订单状态。
 结合最近对话理解情绪、表情和省略：议价后的“？”“小刀一下啊”仍在谈议价；材质追问“都想了解”指之前提及的部位。单独表情不应强行引导查询四种材质，也不因表达情绪而转人工。
 greeting是纯问候、在吗；若同时问业务问题，应按业务意图。ack是纯谢谢、收到、好的、那好吧、行吧等简短回应。议价后的“那好吧”表示接受或暂时考虑，不是继续议价；若同时问新问题则按新问题分类。
@@ -303,7 +303,7 @@ def _verified_answer(store, *, message: str, facts: dict | None,
     if category == "listing_size":
         size = listing_size_fact(facts)
         if size:
-            return _reply(store, version, "这条链接商品资料标的是" + size + "码哈。",
+            return _reply(store, version, "这款是" + size + "码哦。",
                           "listing_size_answered", sources=["local_product"], knowledge_status="matched", fixed_reply=True, **metadata)
         return _reply(store, version, "这款的尺码我这边资料还没标清楚，先以商品页面的尺码说明为准哈。",
                       "listing_size_unknown", knowledge_status="unavailable", fixed_reply=True, **metadata)
@@ -332,21 +332,12 @@ def _verified_answer(store, *, message: str, facts: dict | None,
         if len({entry["answer"] for entry in alternatives}) > 1:
             return _handoff("faq_conflict", **metadata)
         answer = faq["answer"]
-        buyer_sizes = buyer_size_context(history, message)
-        if not faq.get("fixed_reply") and buyer_sizes and _is_size_fit_faq(faq):
-            # A FAQ's numerical example must never overwrite this buyer's size.
-            answer = "选码要结合平时穿的鞋类型和脚型，现有通用说明不能确认这双就一定合脚。"
-            current_size = buyer_sizes[-1]
-            if current_size.get("shoe_type"):
-                answer = "明白，你平时" + current_size["shoe_type"] + current_size["size"] + "码。"
-                if current_size.get("listing_size"):
-                    answer += "你提到描述里这双是" + current_size["listing_size"] + "码，不能直接认定合适，建议先核对鞋内长。"
-                else:
-                    answer += "选这双还需要核对对应尺码和鞋内长，不能直接保证合脚。"
-            else:
-                answer = "你说的" + buyer_sizes[-1]["size"] + "码是平时运动鞋还是皮鞋的尺码？这会影响判断，不能直接保证合适。"
+        # Keep the reviewed guide intact. Buyer memory and actual listing size
+        # are separate context, never replacement policy or a forced question.
+        size_guidance = _is_size_fit_faq(faq)
         return _reply(store, version, answer, "faq_answered", faq_id=faq["id"],
-                      sources=["reviewed_faq"], knowledge_status="matched", fixed_reply=faq.get("fixed_reply", False), **metadata)
+                      sources=["reviewed_faq"], knowledge_status="matched", fixed_reply=faq.get("fixed_reply", False),
+                      size_guidance=size_guidance, product_size=listing_size_fact(facts) if size_guidance else "", **metadata)
     if not facts or not str(facts.get("item_id") or facts.get("id") or facts.get("title") or "").strip():
         return _handoff("product_unidentified", **metadata)
     try:
@@ -404,9 +395,9 @@ NATURAL_REPLY_PROMPT = """你是闲鱼店铺的商品咨询助手，将核实过
 买家可见答复不用“人工客服”“转人工”“人工处理”等内部流转话术；确实需要转接确认时只说“我看看哈”。不声称已联系或已通知店主，不承诺回复时间；商品材质等已核实事实必须原样保留。
 避开avoid_replies中的完整句子和相同句式；换一个表达角度，不能只替换“哦/啦”。revision若非空，针对指出的问题重写，事实与政策保持原意。
 连续议价可以承接买家情绪，但不增加降价空间。首次说明价格政策，反复追问时只用一句简短答复，不重新宣读全部规则，不编造成本、亏本、最低价等理由。即使反复议价也保持耐心，不说“再求也一样”“都说了”“别问了”等教训、讽刺或不耐烦的话。不主动追加“合适再拍”“直接拍”“按流程走”等购买引导；只有买家询问如何购买时才介绍下单。买家改问下单或材质时立即切换话题，不继续拒绝议价。
-正常购物寒暄可以简短接话；致谢就简短收尾，不再介绍服务范围。清楚的问题不能反问“你想问刚才的还是别的问题”。已经回答过的澄清信息不得再问。已明确平时某种鞋的尺码，就围绕这个信息回答，不再把另一种鞋码当成必须补充的条件；不确定合脚时说明需核对鞋内长。
+正常购物寒暄可以简短接话；致谢就简短收尾，不再介绍服务范围。清楚的问题不能反问“你想问刚才的还是别的问题”。已经回答过的澄清信息不得再问。已明确平时某种鞋的尺码，就围绕这个信息回答，不再把另一种鞋码当成必须补充的条件；选码时优先解释审核FAQ给出的参考方法，不要只说“不能保证合适”或反复要求核对鞋内长。
 buyer_size_context中非空的shoe_type代表买家已说明鞋类型；size是买家自述的平时尺码，listing_size只是买家对商品描述的转述。使用最新自述，不能拿FAQ数值示例覆盖，不保证合脚。
-当前商品尺码只依据verified_answer，不依据历史、买家自述或FAQ示例补充码数。资料未明确的码制不能猜测。买家询问其他规格时按审核的规格说明答复，不因历史中有买家尺码就改成选码建议。不声称查过其他链接或其他链接一定有货，不承诺某个规格的补货日期；只有审核答案明确提供的上新安排才可转述。
+尺码答复直接说“这款是…码”，不说“链接显示”“商品资料标的是”“页面写的是”等资料来源话术。选码问题先使用verified_answer中的审核指南，不能把它换成固定追问或免责套话。首次解释码制及换码参考；后续承接已知信息简短回答，不逐轮重复整段FAQ。不知道买家鞋类型时也先给已有指南，无需强制追问才能回答。product_size是本地商品明确标注的尺码，为空表示未知；非空时可结合买家平时同一码制的尺码说明偏大／偏小及参考建议，但不保证合脚。不知道码制时不要直接换算。FAQ中的数字只是示例，不是商品实有码数或买家的码数。当前商品尺码只依据product_size或verified_answer明确的商品事实，不依据历史、买家自述或FAQ示例补充码数。资料未明确的码制不能猜测。买家询问其他规格时按审核的规格说明答复，不因历史中有买家尺码就改成选码建议。不声称查过其他链接或其他链接一定有货，不承诺某个规格的补货日期；只有审核答案明确提供的上新安排才可转述。
 没有试穿反馈时直接说明，不假称自己穿过。概览只介绍现有资料，追问其他参数时优先补充未讲的内容。
 材质名称和组成完整保留，包括加号；不把复合材质概括成单一材质。不增加未提供的价格、库存、性能、物流、退换或服务承诺；不能为了表达生动而编事实。
 不改变店铺政策，不提供站外联系方式或交易方式，不声称已改价、发货、查过订单或完成实际操作。不要假称自己是真人。"""
@@ -452,6 +443,7 @@ def _natural_answer(model_call, result, message, history, revision=""):
     raw = model_call([{"role": "system", "content": NATURAL_REPLY_PROMPT}, {"role": "user", "content": json.dumps({
         "verified_answer": result["reply"], "intent": result.get("intent"), "history": context,
         "buyer_size_context": buyer_size_context(history, message),
+        "size_guidance": bool(result.get("size_guidance")), "product_size": result.get("product_size", ""),
         "avoid_replies": recent_replies(history), "message": message, "revision": revision}, ensure_ascii=False)}])
     value = json.loads(raw)
     text = value.get("reply") if isinstance(value, dict) and set(value) == {"reply"} else None
@@ -460,7 +452,7 @@ def _natural_answer(model_call, result, message, history, revision=""):
     text = buyer_facing_text(text.strip())
     source = result["reply"]
     # Generated language cannot add numbers, links, contact details or transactional promises.
-    allowed_numbers = source + " " + " ".join(x["size"] + " " + x.get("listing_size", "") for x in buyer_size_context(history, message))
+    allowed_numbers = source + " " + result.get("product_size", "") + " " + " ".join(x["size"] + " " + x.get("listing_size", "") for x in buyer_size_context(history, message))
     if set(re.findall(r"\d+(?:\.\d+)?", text)) - set(re.findall(r"\d+(?:\.\d+)?", allowed_numbers)):
         raise ReplyGenerationError("new_numbers")
     for pattern in (r"https?://|www\.|微信|加我|手机号|支付宝", r"保证|承诺|已经.{0,4}(?:发货|改价|退款)|给你.{0,4}(?:优惠|便宜)|可以.{0,3}(?:优惠|议价|少点)|包邮|最低价|亏本|成本价"):
@@ -493,6 +485,8 @@ def _natural_answer(model_call, result, message, history, revision=""):
             raise ReplyGenerationError("recent_duplicate")
         if repeated_price_phrase(text, recent_replies(history)):
             raise ReplyGenerationError("repeated_price_phrase")
+    if result.get("size_guidance") and re.search(r"(?:标(?:注)?的是|(?:商品|页面|链接|资料).{0,6}(?:标(?:注|的|明)?|显示|写的))", text):
+        raise ReplyGenerationError("size_source_wording")
     if re.search(r"(?:感谢|谢谢).{0,4}理解|见谅|理解你[的这].{0,3}诚意", text):
         raise ReplyGenerationError("stiff_template")
     if re.search(r"再求|都说了|别问了|不要再问|纠缠|说多少遍|说了多少|再问.{0,6}一样|(?:那|就|先).{0,2}这样[吧。～~！!]*$|随便你|爱买不买", text):
@@ -536,7 +530,8 @@ def answer_material_question(store, *, message: str, facts: dict | None,
             # A single bounded rewrite for a valid-but-unusable answer; do not
             # multiply requests on network failures or malformed provider JSON.
             if isinstance(error, ReplyGenerationError) and fallback_reason != "invalid_generated_reply" and attempt == 0:
-                revision = {"stiff_template": "上一稿像客服套话。删掉感谢理解、见谅等客套，用一句日常聊天直接回应。",
+                revision = {"size_source_wording": "直接说这款是几码，不使用商品标注、链接显示、资料写着等来源话术；保留选码指南。",
+                            "stiff_template": "上一稿像客服套话。删掉感谢理解、见谅等客套，用一句日常聊天直接回应。",
                             "repeated_price_phrase": "上一稿重复了最近答复中的价格短句或结尾。不要反复补充同一句标价说明；简短承接当前追问，换句式，保持不降价即可。",
                             "recent_duplicate": "上一稿与最近回复重复。请换句式和回应角度，仍回答同一个问题。",
                             "dismissive_tone": "上一稿显得不耐烦或在教训买家。保持平等、耐心，只简短表达价格不变，不评论买家反复追问。",

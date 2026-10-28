@@ -92,23 +92,36 @@ def main():
         def size_model(messages):
             data = json.loads(messages[-1]["content"]); captured.append(data)
             if "verified_answer" in data:
-                return json.dumps({"reply": "你说的40码是平时运动鞋还是皮鞋的尺码？"}, ensure_ascii=False)
+                return json.dumps({"reply": "这款是标准皮鞋码，先按选码指南参考哦。"}, ensure_ascii=False)
             return model("faq", faq_id="size")(messages)
         sized = ask("我看描述上只有41码 我可以穿吗", history=hist, model_call=size_model)
-        assert sized["reply_method"] == "model_grounded" and "40" in sized["reply"] and "42" not in sized["reply"]
+        assert sized["reply_method"] == "model_grounded" and "标准皮鞋码" in sized["reply"] and "还是皮鞋" not in sized["reply"]
         assert len(captured[0]["history"]) > 8 and captured[1]["buyer_size_context"][0]["size"] == "40"
-        assert "42" not in captured[1]["verified_answer"]
+        assert captured[1]["verified_answer"] == size_faq["answer"], "Buyer size must not replace the reviewed guide"
         followup_history = hist[:2] + [{"role": "user", "content": "平时皮鞋，我看描述上就41码，我可以穿嘛"},
                                      {"role": "assistant", "content": "你说的40码是平时运动鞋还是皮鞋的尺码？"}]
         for followup in ["皮鞋", "皮鞋的尺码啊"]:
             memory = buyer_size_context(followup_history, followup)[-1]
             assert memory["size"] == "40" and memory["shoe_type"] == "皮鞋" and memory["listing_size"] == "41", memory
             response = ask(followup, history=followup_history, model_call=model("faq", faq_id="size"))
-            assert "平时皮鞋40码" in response["reply"] and "这双是41码" in response["reply"]
+            assert response["reply"] == size_faq["answer"]
             assert "还是皮鞋" not in response["reply"]
         short_answer = ask("皮鞋", history=hist[:2], model_call=model("unclear"))
-        assert short_answer["reason_code"] == "faq_answered" and "平时皮鞋40码" in short_answer["reply"]
+        assert short_answer["reason_code"] == "faq_answered" and short_answer["reply"] == size_faq["answer"]
         assert buyer_size_context(hist[:2], "不是皮鞋")[-1]["shoe_type"] == ""
+        captured.clear()
+        ask("我的脚41码会不会偏大，能不能穿", facts={"title": "合成鞋43码"}, model_call=size_model)
+        assert captured[1]["verified_answer"] == size_faq["answer"]
+        assert captured[1]["product_size"] == "43" and captured[1]["buyer_size_context"][-1]["size"] == "41"
+        assert captured[1]["size_guidance"] is True
+        def source_wording(messages):
+            if "verified_answer" in json.loads(messages[-1]["content"]):
+                return json.dumps({"reply": "商品资料标的是43码，标准皮鞋码。"}, ensure_ascii=False)
+            return model("faq", faq_id="size")(messages)
+        rejected = ask("能穿吗", facts={"title": "合成鞋43码"}, model_call=source_wording)
+        assert rejected["reply_method"] == "verified_fallback" and rejected["reply"] == size_faq["answer"]
+
+
 
         # SKU availability must retain its reviewed policy even after a buyer
         # supplied their own size. Synthetic policy only; no shop data here.
@@ -134,7 +147,7 @@ def main():
             for question in ["有什么码", "是43码么？", "是40码么？"]:
                 result = ask(question, facts=details, history=availability_context, model_call=model("listing_size"))
                 assert_reply(result, "listing_size_answered")
-                assert "43码" in result["reply"] and "40" not in result["reply"]
+                assert result["reply"] == "这款是43码哦。"
         for details in [{}, {"description": "平时运动鞋42选41"}, {"title": "43码", "description": "尺码42"},
                         {"description": "尺码40-43"}, {"description": "没有43码"}, {"description": "货号TEST100-43码"}]:
             assert listing_size_fact(details) == "", details
@@ -144,9 +157,9 @@ def main():
         # Adding a second FAQ that mentions sizes cannot disable short fit
         # clarification resolution or change its buyer-specific size handling.
         short_answer = ask("皮鞋", history=hist[:2], model_call=model("unclear"))
-        assert short_answer["faq_id"] == "size" and "平时皮鞋40码" in short_answer["reply"]
+        assert short_answer["faq_id"] == "size" and short_answer["reply"] == size_faq["answer"]
         fit_answer = ask("这个码我能穿吗", history=availability_context, model_call=model("faq", faq_id="size"))
-        assert "平时皮鞋40码" in fit_answer["reply"]
+        assert fit_answer["reply"] == size_faq["answer"]
         assert ask("有其他码数吗", facts=None)["reply"] == availability["answer"]
         availability["enabled"] = False
         store.save_faqs([size_faq, availability])
