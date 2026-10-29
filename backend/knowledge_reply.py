@@ -19,7 +19,7 @@ FIELD_LABELS = {"upper": "鞋面", "lining": "内里", "insole": "鞋垫", "sole
 INTENTS = {"greeting", "ack", "material", "faq", "business_human", "human", "unclear", "other", "platform_contact", "purchase", "social", "comfort", "overview", "listing_size"}
 HUMAN_REQUEST = re.compile(r"转(?:接)?人工|人工客服|真人客服|人工接管|找(?:个)?(?:人|客服)|联系人工")
 HUMAN_NEGATION = re.compile(r"(?:不要|不用|无需|别|不需要|暂不|不想)\s*(?:再|给我|帮我)?\s*(?:转(?:接)?人工|联系人工|找人工|人工客服|真人客服)")
-GREETING = re.compile(r"(?:您好|你好|在吗|在不在|哈喽|hello|hi|嗨)[!?？！。，.,~\s]*", re.I)
+GREETING = re.compile(r"(?:您好|你好|在吗|在不在|哈喽|hello|hi|嗨|在线吗|有上线吗|上线了吗)[!?？！。，.,~\s]*", re.I)
 ACK = re.compile(r"(?:谢谢(?:你|您)?|感谢|那好吧|好吧|行吧|那好|好的|好|收到|明白|了解|ok|thanks|thank you)[!?？！。，.,~\s]*", re.I)
 BUSINESS_SCOPE = re.compile(r"退款|赔偿|发货|物流|快递|到货|能到|送到|几天到|开票|发票|包邮|运费|多少钱|价格|便宜|议价|库存|有货|尺码|码数|防水|防滑|舒服|保养|付款|订单|退货|换货")
 UNSAFE_QUESTION = re.compile(r"忽略.{0,12}(?:规则|指令)|编造|系统提示|提示词|执行命令|密码|口令|密钥|api[ _-]?key|cookie|authorization|bearer", re.I)
@@ -32,16 +32,22 @@ CLASSIFIER_PROMPT = """你是店铺客服的语义意图分类器。不能回答
 只输出包含 intent、fields、faq_id 三个字段的 JSON，不输出答复或其他字段。intent只能是 greeting/ack/material/faq/business_human/human/unclear/other/platform_contact/purchase/social/comfort/overview/listing_size，只有intent决定类别。
 platform_contact是要求加微信、加v、➕v、加QQ、电话或站外沟通／交易。用此类别引导留在闲鱼沟通，不归为无关闲聊，不提供联系方式。
 fields必须始终是JSON数组，不能是字符串或null。material时从upper鞋面、lining内里、insole鞋垫、sole鞋底选择；问整双材质选四项。非material必须fields=[]。结合历史理解‘里面呢’‘底呢’。
+“头层牛皮吗”“鞋面是真皮吗”“牛皮的吗”是确认鞋面材质，选material和upper；没有商品关联或资料缺失由程序处理，不得自行推断。
 social是购物过程中的寒暄、回来继续聊、笑脸、感谢或情绪表达，如“哈哈我又回来了”；不要判other。议价后的“求求你”“真的不行吗”优先继续议价FAQ。
 comfort是询问脚感、舒适、穿着体验，如“穿起来舒服吗”“平时穿起来感觉如何”，意图已明确，不能unclear；没有试穿资料也可以诚实说明不知道，不能虚构体验。
 overview是介绍这双鞋、还有哪些参数、其他材质等概览请求；不代表索要全部未知属性。材质字段仍必须fields=[]，程序选取实际有的资料。
 尺码FAQ里的“运动鞋42选41”属于通用示例，不是买家尺码。必须记住用户自己提供的尺码及鞋类型，不能用示例覆盖。问“40码能穿41吗”“我的脚41码会不会偏大，能不能穿”意图明确，有适用审核FAQ时选尺码FAQ，不选unclear或business_human。选码话题后的“皮鞋”“运动鞋”是补充鞋类型；“你就说可不可以”“到底能不能穿”仍是选码追问，继续选适用尺码FAQ，不当作人工请求或必须保证合脚的业务操作。
 purchase是询问如何在闲鱼正常下单、怎么买、在哪拍；仅说明商品页下单流程，不涉及代操作、改价、订单状态。
 结合最近对话理解情绪、表情和省略：议价后的“？”“小刀一下啊”仍在谈议价；材质追问“都想了解”指之前提及的部位。单独表情不应强行引导查询四种材质，也不因表达情绪而转人工。
-greeting是纯问候、在吗；若同时问业务问题，应按业务意图。ack是纯谢谢、收到、好的、那好吧、行吧等简短回应。议价后的“那好吧”表示接受或暂时考虑，不是继续议价；若同时问新问题则按新问题分类。
+greeting是纯问候、在吗、在线吗、有上线吗；若同时问业务问题，应按业务意图。ack是纯谢谢、收到、好的、那好吧、行吧等简短回应。议价后的“那好吧”表示接受或暂时考虑，不是继续议价；若同时问新问题则按新问题分类。
 human是明确真实人工请求；注意‘不要转人工’‘不用人工客服’是否定，不能视为请求人工。材质问题混合真实人工请求时human优先。
 faq只有能够由当前enabled_faqs中的一条已审核问题完整回答时才使用，并返回对应faq_id；不能选不存在的ID或生成答案。
 先理解口语再匹配审核FAQ：‘能刀吗’‘小刀一下’‘可刀不’‘少点呗’‘80出吗’是议价／报价；‘偏码吗’‘平时运动鞋42’是尺码；‘几成新’‘试穿过没’是成色；‘啥时候寄’是发货时效。有对应FAQ时选择faq，不因是业务问题直接转人工。数字报价结合历史理解，不把尺码数字当价格。
+同时问当前商品是否卖掉和有没有其他码数或颜色时，若有覆盖两部分的审核FAQ则选择该FAQ；只问当前商品是否能买时选择相应FAQ。页面可购买不等于查询到实时库存；查其他链接库存或实际订单状态仍需核实。
+“这个找个40的”“下面黑色有没有40的”结合鞋类上下文通常是找尺码，选其他规格FAQ，不是议价；“80吧”“80出吗”结合上下文是报价，有适用议价FAQ时选择该FAQ。含糊数字结合历史，不能仅凭数字误判。
+“瑕疵在哪”“划痕在哪里”若有引导查看图片或已有视频的审核FAQ则选择它，不猜位置；一般成色问题另选成色FAQ。
+“这是皮鞋码吗”“是运动鞋码吗”是询问码制，有专门的审核FAQ时选择它，不是查询具体数字码数；不能选listing_size。单独补充“皮鞋码”须结合前文理解。
+“你是机器人吗”“是AI吗”若只询问身份属于social，如实承认智能客服并询问需要了解什么；明确要求真人仍是human，不能假称真人。
 listing_size是询问当前链接的实际尺码，如“有什么码”“这双几码”“是43码么”，由程序读取当前商品资料，不从买家自己的码数或历史回复推断。确认当前标注码数不能选选码FAQ，也不因涉及规格直接选business_human。
 规格咨询需区分可选规格与适配建议：“有其他码吗”“有没有某个码”“还有别的颜色吗”“大一码呢”是规格可售范围咨询，优先匹配说明可选尺码／颜色或其他链接的审核FAQ；不能仅因涉及库存就选business_human，也不要选讲偏码、脚型、合脚的选码FAQ。用户说过平时尺码后改问有没有该码，仍属于可选规格。“这个又小了一号，哈哈”“这个鞋不错，就是大了一号”是在表达当前规格不合适，有适用的规格FAQ时选择该FAQ，不因“哈哈”判social，不直接转接。“皮鞋码”结合前文理解：若在补充想找的规格，继续对应规格FAQ；若在回答鞋类型澄清，则选选码FAQ；若在问当前商品的码制，则选listing_size。问“这个码我能穿吗”“偏大偏小吗”才是适配／选码建议。买家要求查询其他链接的实际库存、保证某规格何时补货、预留或修改已下单规格，普通规格说明不能回答，没有相应资料时business_human。不得从通用FAQ推断其他链接一定有货。
 物流问题需细分：下单后多久发出、多久到、预计几天收到属于发货或配送时效；下单发什么快递、发什么快递、走哪家、默认哪家快递，以及换快递、指定快递公司、补差价换物流，均属于承运商选择；只要有完整适用的审核FAQ就选择faq，不选business_human或purchase。结合历史理解“我补差价也不行吗”等省略追问，选择能完整回答的对应FAQ。明确的物流时效问题不能误判为如何下单。
@@ -307,6 +313,8 @@ def _verified_answer(store, *, message: str, facts: dict | None,
                           "listing_size_answered", sources=["local_product"], knowledge_status="matched", fixed_reply=True, **metadata)
         return _reply(store, version, "这款的尺码我这边资料还没标清楚，先以商品页面的尺码说明为准哈。",
                       "listing_size_unknown", knowledge_status="unavailable", fixed_reply=True, **metadata)
+    if category == "social" and re.search(r"(?:你|是|是不是|有没有).{0,5}(?:AI|ai|机器人|智能客服|机器客服)", message):
+        return _reply(store, version, "我是智能客服哦，有什么想了解的可以问我呀～", "social_answered", **metadata)
     if category == "social":
         return _reply(store, version, "哈哈，回来啦，接着看这双？", "social_answered", **metadata)
     if category == "comfort":

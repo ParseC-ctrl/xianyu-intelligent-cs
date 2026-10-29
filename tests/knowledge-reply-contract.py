@@ -46,6 +46,15 @@ def main():
         assert_reply(answer, "material_answered")
         assert answer["reply"] == "这款鞋的鞋面材质是头层牛皮+织物，内里材质是织物。"
         assert answer["sources"] == ["material_excel"]
+        confirmation = ask("头层牛皮吗？", model_call=model(fields=["upper"]))
+        assert_reply(confirmation, "material_answered")
+        assert "头层牛皮+织物" in confirmation["reply"]
+        missing = ask("头层牛皮吗？", facts={"title": "合成未关联商品"}, model_call=model(fields=["upper"]))
+        assert missing["decision"] == "handoff"
+        assert_reply(ask("有上线吗"), "greeting_answered")
+        robot = ask("你是AI吗", model_call=model("social"))
+        assert_reply(robot, "social_answered")
+        assert "智能客服" in robot["reply"]
 
         # The live generator receives only a verified answer and bounded history.
         calls = []
