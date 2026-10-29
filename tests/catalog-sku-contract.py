@@ -31,6 +31,35 @@ def run():
     assert result("无货号", ["DEMO2002-02", "DEMO2002-02-43"])[0]["codes"] == ["DEMO2002-02"]
     assert result("无货号", ["DEMO 2002 – 02"])[0]["codes"] == ["DEMO2002-02"]
     assert result("无货号", ["UNKNOWN123-01-43"])[0]["codes"] == ["UNKNOWN123-01-43"]
+    # The trailing shoe size is not part of the catalogue SKU. Each example is
+    # synthetic; include letters before and after digits, and different sizes.
+    fixtures = [
+        ("DEMOX6938-02-42", "DEMOX6938-02"),
+        ("DEMOY6105-01-40", "DEMOY6105-01"),
+        ("DEMO30155A-01-43", "DEMO30155A-01"),
+        ("DEMO35127-03-40", "DEMO35127-03"),
+        ("DEMO3097M-02-38", "DEMO3097M-02"),
+    ]
+    known = {sku for _, sku in fixtures}
+    for full, sku in fixtures:
+        item = {"description": "模拟商品描述，款式及尺码见页面。 " + full, "image_urls": []}
+        checked = reconcile_sku(item, known, Mock())
+        assert checked["sku_check"]["description_code"] == sku, (full, checked)
+        assert checked["codes"] == [sku]
+        assert checked["sku_check"]["status"] == "description_only"
+    item = {"description": "DEMOX6938-02-42", "image_urls": []}
+    both = known | {"DEMOX6938-02-42"}
+    assert reconcile_sku(item, both, Mock())["codes"] == ["DEMOX6938-02-42"]
+    assert reconcile_sku({"description": "货号 DEMOX6938-02-42", "image_urls": []}, known, Mock())["codes"] == ["DEMOX6938-02"]
+    assert reconcile_sku({"description": "DEMOX6938–02–42", "image_urls": []}, known, Mock())["codes"] == ["DEMOX6938-02"]
+    assert not reconcile_sku({"description": "DEMOX6938-02-34", "image_urls": []}, known, Mock())["codes"]
+    assert not reconcile_sku({"description": "UNKNOWN123-01-42", "image_urls": []}, known, Mock())["codes"]
+    assert not reconcile_sku({"description": "DEMO10001-42", "image_urls": []}, {"DEMO10001"}, Mock())["codes"]
+    assert reconcile_sku({"description": "货号 DEMO10001-42", "image_urls": []}, {"DEMO10001"}, Mock())["codes"] == ["DEMO10001-42"]
+    assert reconcile_sku({"description": "货号 UNKNOWN123-01-42", "image_urls": []}, known, Mock())["codes"] == ["UNKNOWN123-01-42"]
+    multi = reconcile_sku({"description": "DEMOX6938-02-42 和 DEMOY6105-01-40", "image_urls": []}, known, Mock())
+    assert multi["sku_check"]["status"] == "ambiguous" and multi["codes"] == []
+    assert reconcile_sku({"title": "DEMOX6938-02-42", "description": "模拟商品", "image_urls": []}, known, Mock())["codes"] == ["DEMOX6938-02"]
     assert result("货号：DEMO10001-01", [], "none")[0]["sku_check"]["status"] == "description_only"
     assert result("货号：UNKNOWN-123", ["DEMO2002-02"])[0]["codes"] == ["UNKNOWN-123"]
     assert result("DEMO10001-01 和 DEMO2002-02", ["DEMO10001-01"])[0]["sku_check"]["status"] == "ambiguous"

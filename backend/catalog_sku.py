@@ -34,14 +34,37 @@ def normalize_code(value):
 
 
 def description_codes(product, known):
-    text = unicodedata.normalize("NFKC", str(product.get("description") or ""))
+    def normalized_text(value):
+        text = unicodedata.normalize("NFKC", str(value or "")).upper()
+        return re.sub(r"\s*-\s*", "-", re.sub(r"[‐‑‒–—―−﹣－]", "-", text))
+
+    def description_identifier(value):
+        code = normalize_code(value)
+        # With only one suffix it might be a colour/model component rather
+        # than a shoe size; require a complete style-colour-size structure.
+        if code not in known and code.count("-") < 2:
+            return code
+        return normalize_visual_code(code, known)
+
+    def known_tokens(text):
+        # Match the complete token before considering a trailing shoe size.
+        # This avoids treating an unknown longer identifier as a known prefix.
+        tokens = re.findall(
+            r"(?<![A-Z0-9_.-])((?:[A-Z]{1,8}[0-9][A-Z0-9]{2,24}|[0-9]{4,24})"
+            r"(?:[-.][A-Z0-9]{1,10}){0,3})(?![A-Z0-9]|[.-][A-Z0-9])", text)
+        return {code for token in tokens if (code := description_identifier(token)) in known}
+
+    text = normalized_text(product.get("description"))
     # An explicitly labelled unknown code still wins over an image code. Do
     # not silently replace an unknown description SKU with a known visual one.
     labelled = re.findall(r"(?:货号|款号|商品编码|SKU)\s*[:：#]?\s*([A-Za-z0-9][A-Za-z0-9_.-]{2,79})", text, re.I)
-    hits = {normalize_code(c) for c in labelled} - {""}
+    hits = {description_identifier(c) for c in labelled} - {""}
     hits.update(_found_codes(text, known))
+    hits.update(known_tokens(text))
     if not hits:
-        hits.update(_found_codes(product.get("title", ""), known))
+        title = normalized_text(product.get("title"))
+        hits.update(_found_codes(title, known))
+        hits.update(known_tokens(title))
     return sorted(hits)
 
 
