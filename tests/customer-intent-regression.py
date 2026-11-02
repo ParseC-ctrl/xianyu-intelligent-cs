@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from material_knowledge import MaterialKnowledgeStore
-from knowledge_reply import answer_material_question, buyer_size_context, listing_size_fact
+from knowledge_reply import _is_size_fit_faq, answer_material_question, buyer_size_context, listing_size_fact
 
 
 def main():
@@ -51,6 +51,35 @@ def main():
         assert ask("哪里发货", facts)["decision"] == "handoff"
         assert ask("转人工", facts, category="human")["reason_code"] == "buyer_requests_human"
         assert ask("退款并问哪里发货", facts)["decision"] == "handoff"
+
+        # Reviewed presale policies remain distinct from actual after-sales operations.
+        more = [
+            {"id": "return", "question": "售前退换规则", "answer": "测试退换政策。", "topics": ["可以退货吗"], "enabled": True, "fixed_reply": True},
+            {"id": "return-fit", "question": "不合脚退换与尺码参考", "answer": "测试退换政策。测试尺码参考。", "topics": ["不合脚能退吗或者换码", "买完以后不合适是否可退退货运费我出"], "enabled": True, "fixed_reply": True},
+            {"id": "auth", "question": "真假与来源", "answer": "测试渠道答复。", "topics": ["是不是正品"], "enabled": True, "fixed_reply": True},
+            {"id": "insole", "question": "是否附带鞋垫", "answer": "测试鞋垫配件答复。", "topics": ["你好有原装鞋垫吗"], "enabled": True, "fixed_reply": True},
+            {"id": "length", "question": "鞋内长是多少", "answer": "测试长度未知。测试尺码参考。", "topics": ["这个内长多少"], "enabled": True, "fixed_reply": True},
+        ]
+        store.save_faqs(faqs + more)
+        assert _is_size_fit_faq(faqs[3]) and not _is_size_fit_faq(more[1])
+        assert ask("42", facts, history=size_context).get("faq_id") == "fit"
+        for question, expected in [("可以退货吗", "return"), ("不合脚能退吗 或者换码", "return-fit"),
+                                   ("买完以后不合适是否可退\n退货运费我出", "return-fit"),
+                                   ("是不是正品", "auth"), ("你好，有原装鞋垫吗。", "insole"),
+                                   ("这个内长多少", "length")]:
+            for wrong in ("business_human", "social"):
+                result = ask(question, facts, category=wrong)
+                assert result.get("faq_id") == expected and result["decision"] == "reply", (question, result)
+        wrong_material = lambda _: json.dumps({"intent": "material", "fields": ["insole"], "faq_id": ""})
+        assert answer_material_question(store, message="你好，有原装鞋垫吗。", facts=facts, model_call=wrong_material)["faq_id"] == "insole"
+        length = ask("这个内长多少", facts)
+        assert "42码" in length["reply"] and "测试长度未知" in length["reply"]
+        unknown_length = ask("这个内长多少", {"title": "测试商品"})
+        assert "42码" not in unknown_length["reply"] and "测试长度未知" in unknown_length["reply"]
+        for question in ["收到鞋了不合脚能退吗", "鞋子有质量问题可以退货吗", "已经下单我要退货", "申请退款"]:
+            result = ask(question, facts, category="social")
+            assert result["reason_code"] == "business_requires_human", (question, result)
+        assert ask("请转人工，不合脚能退吗", facts, category="human")["reason_code"] == "buyer_requests_human"
     print("customer intent regression: ok")
 
 
