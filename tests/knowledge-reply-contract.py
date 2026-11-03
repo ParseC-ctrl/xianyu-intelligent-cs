@@ -53,6 +53,8 @@ def main():
             assert result["reason_code"] == "size_chart_request", (question, result)
         unrelated = [{"role": "assistant", "content": "鞋面是合成材质。"}]
         assert ask("你再发一次", history=unrelated, model_call=model("business_human"))["decision"] == "handoff"
+        after_handoff = [{"role": "user", "content": "重新发一次尺码图"}, {"role": "assistant", "content": "我看看哈"}]
+        assert ask("你再发一次", history=after_handoff, model_call=model("business_human"))["reason_code"] == "size_chart_request"
         assert ask("请转人工", model_call=model("human"))["reason_code"] == "buyer_requests_human"
         assert ask("脚宽不合适想退货", model_call=model("business_human"))["decision"] == "handoff"
         material_model = model(fields=["upper", "lining"])

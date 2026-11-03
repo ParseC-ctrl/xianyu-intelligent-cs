@@ -46,6 +46,8 @@ class SizeChartTests(unittest.TestCase):
         self.assertTrue(size_chart.explicitly_requests_chart("重新发一次尺码图"))
         self.assertTrue(size_chart.wants_chart("你再发一次", history))
         self.assertFalse(size_chart.explicitly_requests_chart("你再发一次", [{"role": "assistant", "content": "鞋子的图片在上面哦"}]))
+        after_handoff = [{"role": "user", "content": "重新发一次尺码图"}, {"role": "assistant", "content": "我看看哈"}]
+        self.assertTrue(size_chart.explicitly_requests_chart("你再发一次", after_handoff))
 
     def test_delivery_status_distinguishes_confirmed_and_uncertain(self):
         digest = size_chart.read_chart(self.root)[1]

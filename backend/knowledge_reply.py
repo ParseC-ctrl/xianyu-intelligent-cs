@@ -101,10 +101,17 @@ def _chart_resend_followup(message: str, history: list | None) -> bool:
     text = unicodedata.normalize("NFKC", str(message or "")).strip()
     if not re.fullmatch(r"(?:你|您|请|麻烦|麻烦你|可以|能不能|帮我|给我|那)*(?:再|重新)(?:给我|帮我|给|帮)?(?:发|发送)(?:一下|一次|一遍|一张|下)?(?:给我)?(?:可以吗|好吗|吗|哈|吧|呀|呢|嘛)?[?？!！。，,\s]*", text):
         return False
-    last = next((entry for entry in reversed(history or []) if isinstance(entry, dict)
-                 and entry.get("role") in {"user", "assistant"}), None)
-    return bool(last and last.get("role") == "assistant" and re.search(
-        r"尺码(?:表|图|对照表|对照图)|码数表|对照表", str(last.get("content") or last.get("text") or "")))
+    turns = [entry for entry in (history or []) if isinstance(entry, dict)
+             and entry.get("role") in {"user", "assistant"}]
+    last = turns[-1] if turns else None
+    if not last or last.get("role") != "assistant":
+        return False
+    chart = r"尺码(?:表|图|对照表|对照图)|码数表|对照表"
+    last_text = str(last.get("content") or last.get("text") or "").strip()
+    if re.search(chart, last_text):
+        return True
+    return bool(last_text == "我看看哈" and len(turns) >= 2 and turns[-2].get("role") == "user"
+                and re.search(chart, str(turns[-2].get("content") or turns[-2].get("text") or "")))
 
 
 def _is_chart_consultation(message: str, history: list | None = None) -> bool:
