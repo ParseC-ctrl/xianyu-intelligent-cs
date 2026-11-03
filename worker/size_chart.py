@@ -39,6 +39,20 @@ def read_chart(state_dir):
         return None
 
 
+def delivery_state(db_path, chat_id, digest):
+    """Only ACKed sends prove a buyer has previously received this chart."""
+    try:
+        with sqlite3.connect(db_path, timeout=10) as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='size_chart_attempts'").fetchone():
+                return "not_sent"
+            rows = conn.execute("SELECT status FROM size_chart_attempts WHERE chat_id=? AND digest=?", (str(chat_id), digest)).fetchall()
+    except sqlite3.Error:
+        return "unknown"
+    if any(row[0] == "sent" for row in rows):
+        return "sent"
+    return "uncertain" if rows else "not_sent"
+
+
 def reserve(db_path, chat_id, source_id, digest, explicit=False):
     """Reserve before the external send; uncertain attempts never auto-retry."""
     with sqlite3.connect(db_path, timeout=10) as conn:

@@ -5076,6 +5076,21 @@ class XianyuLive:
             record_no_reply("empty_reply")
             return
         bot_reply = bot_reply.strip()
+        if (getattr(self, "knowledge_only", False) and reply_from_ai and not replaying_draft
+                and reason_code == "size_chart_request"):
+            chart = size_chart.read_chart(self.state_dir)
+            if chart:
+                state = size_chart.delivery_state(self.chat_db_file, chat_id, chart[1])
+                if size_chart.explicitly_requests_chart(content):
+                    bot_reply = "好呀，我给你发一张尺码对照表参考哈～"
+                elif state == "sent":
+                    bot_reply = "尺码对照表前面发过啦，可以对照脚长和脚宽看看哈～"
+                elif state in {"uncertain", "unknown"}:
+                    bot_reply = "刚才图片的发送状态暂时没确认，你可以说一声再发一下哈～"
+                else:
+                    bot_reply = "可以对照尺码表看看脚长和脚宽，我发一张给你参考哈～"
+            else:
+                bot_reply = "尺码表暂时没有准备好，可以先参考商品的尺码说明哈。"
         if len(bot_reply) > self.MAX_REPLY_CHARS:
             if rule_matched or replaying_draft:
                 bot_reply = bot_reply[: self.MAX_REPLY_CHARS]

@@ -341,6 +341,29 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
             await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "脚长多少", "chart-failed-text")
         agent._send_size_chart_after_reply.assert_not_awaited()
 
+    async def test_chart_consultation_uses_confirmed_delivery_and_resend_intent(self):
+        import size_chart
+        agent, _ = self.build_agent(mode="rules_ai")
+        agent.knowledge_only = True
+        agent._customer_conversation_scope = AsyncMock(return_value="owned")
+        agent._wait_for_buyer_pause = AsyncMock(return_value=(True, False))
+        agent._pending_buyer_fragments = Mock(return_value=False)
+        agent._local_knowledge_item_context = Mock(return_value={"item_id": API_ITEM})
+        agent._ensure_ai_reply_ready = AsyncMock()
+        agent._generate_llm_reply = AsyncMock(return_value=GeneratedReply("尺码图", "reply", "size_chart_request", 1, "a" * 64))
+        agent.human_reply_delay = AsyncMock(return_value=0)
+        agent._send_size_chart_after_reply = AsyncMock()
+        (Path(agent.state_dir) / "size_chart.png").write_bytes(size_chart.PNG_SIGNATURE + b"fixture")
+        digest = size_chart.read_chart(agent.state_dir)[1]
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "有没有对应的尺码表", "chart-unsent")
+        self.assertIn("发一张", agent.send_text_reliably.await_args.args[2])
+        size_chart.reserve(agent.chat_db_file, CHAT_ID, "record", digest)
+        size_chart.finish(agent.chat_db_file, CHAT_ID, "record", "sent")
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "脚长多少啊", "chart-sent")
+        self.assertIn("前面发过", agent.send_text_reliably.await_args.args[2])
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "再发一下那个尺码表", "chart-again")
+        self.assertIn("给你发一张", agent.send_text_reliably.await_args.args[2])
+
     async def test_customer_new_fragment_during_generation_suppresses_old_answer(self):
         agent, bot = self.build_agent(mode="rules_ai")
         agent.knowledge_only = True

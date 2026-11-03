@@ -44,7 +44,11 @@ def main():
         assert ask("再发下尺码表", model_call=model("human"))["reason_code"] == "size_chart_unavailable"
         (store.account_dir / "size_chart.png").write_bytes(b"\x89PNG\r\n\x1a\nfixture")
         assert ask("再发下尺码表", model_call=model("human"))["reason_code"] == "size_chart_request"
+        for question in ["有没有对应的尺码表", "再发一下那个尺码表", "脚长多少啊", "脚宽\n该码的脚宽多少"]:
+            result = ask(question, model_call=lambda _: (_ for _ in ()).throw(RuntimeError("unavailable")))
+            assert result["reason_code"] == "size_chart_request", (question, result)
         assert ask("请转人工", model_call=model("human"))["reason_code"] == "buyer_requests_human"
+        assert ask("脚宽不合适想退货", model_call=model("business_human"))["decision"] == "handoff"
         material_model = model(fields=["upper", "lining"])
         answer = ask("材质?", model_call=material_model)
         assert_reply(answer, "material_answered")

@@ -39,6 +39,19 @@ class SizeChartTests(unittest.TestCase):
         self.assertFalse(size_chart.wants_chart("鞋面是什么材质"))
         self.assertTrue(size_chart.explicitly_requests_chart("再发下尺码表"))
         self.assertFalse(size_chart.explicitly_requests_chart("这个尺码多少"))
+        self.assertTrue(size_chart.explicitly_requests_chart("再发一下那个尺码表"))
+        self.assertFalse(size_chart.explicitly_requests_chart("有没有对应的尺码表"))
+
+    def test_delivery_status_distinguishes_confirmed_and_uncertain(self):
+        digest = size_chart.read_chart(self.root)[1]
+        self.assertEqual(size_chart.delivery_state(self.db, "chat", digest), "not_sent")
+        self.assertTrue(size_chart.reserve(self.db, "chat", "one", digest))
+        self.assertEqual(size_chart.delivery_state(self.db, "chat", digest), "uncertain")
+        size_chart.finish(self.db, "chat", "one", "failed")
+        self.assertEqual(size_chart.delivery_state(self.db, "chat", digest), "uncertain")
+        self.assertTrue(size_chart.reserve(self.db, "chat", "two", digest, explicit=True))
+        size_chart.finish(self.db, "chat", "two", "sent")
+        self.assertEqual(size_chart.delivery_state(self.db, "chat", digest), "sent")
 
     def test_once_per_conversation_explicit_resend_and_failure(self):
         async def run():

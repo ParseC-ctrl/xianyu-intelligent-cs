@@ -97,6 +97,16 @@ def _positive_human_request(text: str) -> bool:
     return bool(HUMAN_REQUEST.search(HUMAN_NEGATION.sub("", text)))
 
 
+def _is_chart_consultation(message: str) -> bool:
+    """Short chart or foot-measurement questions need no invented measurement."""
+    text = unicodedata.normalize("NFKC", str(message or "")).strip()
+    if not text or len(text) > 120 or _positive_human_request(text) or UNSAFE_QUESTION.search(text):
+        return False
+    if re.search(r"退|换货|换码|退款|质量|瑕疵|订单|物流|快递|发货|价格|多少钱|优惠|材质|正品", text):
+        return False
+    return bool(re.search(r"尺码表|码数表|尺码对照表|尺码对照图|对照表|脚长|脚宽|足长|足宽", text))
+
+
 def _last_assistant_is(history, reply: str) -> bool:
     for entry in reversed((history or [])[-8:]):
         if isinstance(entry, dict) and entry.get("role") == "assistant":
@@ -333,6 +343,12 @@ def _verified_answer(store, *, message: str, facts: dict | None,
     except Exception:
         return _handoff("knowledge_unavailable")
     method = "model" if model_call else "offline_rules"
+    if _is_chart_consultation(message):
+        chart = store.account_dir / "size_chart.png"
+        metadata = {"intent_method": "local_chart", "intent": "size_chart"}
+        if chart.is_file() and not chart.is_symlink():
+            return _reply(store, version, "可以参考尺码对照表看看哈。", "size_chart_request", fixed_reply=True, **metadata)
+        return _reply(store, version, "尺码表暂时没有准备好，可以先参考商品的尺码说明哈。", "size_chart_unavailable", fixed_reply=True, **metadata)
     try:
         intent = recognize_intent(message, history, model_call, enabled_faqs)
     except Exception:
