@@ -42,11 +42,18 @@ def main():
     # Linux. This upload/auth test runs as a normal macOS developer as well.
     with patch.object(app, "maintenance_active", return_value=False), patch.object(app, "start_services"), TestClient(app.app) as client:
         assert client.get("/api/bot/materials/status").status_code == 401
+        assert client.get("/api/bot/materials/size-chart").status_code == 401
         registration = client.post("/api/auth/register", json={"username": "material-admin", "password": "fixture-material-password"}, headers=headers)
         assert registration.status_code == 200, registration.json()
         login = client.post("/api/auth/login", json={"username": "material-admin", "password": "fixture-material-password"}, headers=headers)
         assert login.status_code == 200
         client.cookies.set("xianyu_saas_session", login.cookies.get("xianyu_saas_session"), path="/")
+        assert client.get("/api/bot/materials/size-chart").json()["configured"] is False
+        chart = b"\x89PNG\r\n\x1a\n" + b"fixture"
+        assert client.put("/api/bot/materials/size-chart", content=chart, headers={**headers, "Content-Type": "image/png"}).json()["configured"] is True
+        assert client.put("/api/bot/materials/size-chart", content=b"invalid", headers={**headers, "Content-Type": "image/png"}).status_code == 400
+        assert client.get("/api/bot/materials/size-chart").json()["configured"] is True
+        assert client.delete("/api/bot/materials/size-chart", headers=headers).json()["configured"] is False
         status = client.get("/api/bot/materials/status").json()
         assert client.get("/api/auth/capabilities").json()["customer_service_only"] is True
         assert client.get("/api/bot/catalog").status_code == 200

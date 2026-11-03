@@ -41,6 +41,10 @@ def main():
         store.import_xlsx(data.getvalue(), "fixture.xlsx")
         facts = {"item_id": "100", "title": "测试鞋 TEST100-01"}
         ask = lambda message, **kwargs: answer_material_question(store, message=message, facts=kwargs.pop("facts", facts), **kwargs)
+        assert ask("再发下尺码表", model_call=model("human"))["reason_code"] == "size_chart_unavailable"
+        (store.account_dir / "size_chart.png").write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+        assert ask("再发下尺码表", model_call=model("human"))["reason_code"] == "size_chart_request"
+        assert ask("请转人工", model_call=model("human"))["reason_code"] == "buyer_requests_human"
         material_model = model(fields=["upper", "lining"])
         answer = ask("材质?", model_call=material_model)
         assert_reply(answer, "material_answered")

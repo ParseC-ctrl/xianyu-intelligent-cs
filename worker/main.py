@@ -500,6 +500,7 @@ from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, gener
 from XianyuAgent import LLMConfigurationError, LLMNotReadyError, LLMServiceError, XianyuReplyBot
 from context_manager import ChatContextManager, normalize_manual_reply_media, normalize_media
 from delivery_store import DeliveryStore, DeliveryStoreError
+import size_chart
 
 
 class GeneratedReply(tuple):
@@ -2581,6 +2582,56 @@ class XianyuLive:
                 }],
             },
         }
+
+    async def _send_size_chart_after_reply(self, chat_id, sender_id, item_id, source_id, message, verify):
+        """Send one private chart after text, with no automatic retry on uncertainty."""
+        if not size_chart.wants_chart(message):
+            return
+        chart = size_chart.read_chart(self.state_dir)
+        if chart is None:
+            return
+        payload, digest = chart
+        temporary = os.path.join(self.state_dir, f"manual_reply_{uuid.uuid4().hex}.png")
+        reserved = False
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(payload)
+
+            async def send_once():
+                nonlocal reserved
+                await verify()
+                current = size_chart.read_chart(self.state_dir)
+                if not current or current[1] != digest:
+                    return None
+                reserved = size_chart.reserve(self.chat_db_file, chat_id, source_id, digest,
+                                             explicit=size_chart.explicitly_requests_chart(message))
+                if not reserved:
+                    return None
+                if not self.ws or not self.connection_ready.is_set():
+                    return None
+                return await self.send_msg(self.ws, chat_id, sender_id, "", message_uuid=str(uuid.uuid5(uuid.NAMESPACE_URL, f"xianyu:chart:{source_id}")),
+                                           media=[{"type": "image", "path": os.path.basename(temporary)}])
+
+            sent_media = await self._send_with_pacing(send_once)
+            if reserved and sent_media:
+                size_chart.finish(self.chat_db_file, chat_id, source_id, "sent")
+                self.context_manager.add_message_by_chat(chat_id, self.myid, item_id, "assistant", "尺码对照表",
+                    source_id="size_chart:" + str(source_id), content_type="image", media=[sent_media])
+            elif reserved:
+                size_chart.finish(self.chat_db_file, chat_id, source_id, "failed")
+        except Exception as exc:
+            if reserved:
+                try:
+                    size_chart.finish(self.chat_db_file, chat_id, source_id, "failed")
+                except Exception:
+                    pass
+            logger.warning("尺码表发送未完成 chat={} error={}", stable_ref(chat_id), type(exc).__name__)
+        finally:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
     @classmethod
     def _sent_media_summary(cls, content):
@@ -5126,6 +5177,10 @@ class XianyuLive:
         self.delivery_store.mark_automation_reply_sent(chat_id)
         clear_needs_human()
         logger.info("机器人回复已发送 chat={} chars={}", stable_ref(chat_id), len(bot_reply))
+        if (getattr(self, "knowledge_only", False) and reply_from_ai and not replaying_draft
+                and reason_code in {"faq_answered", "listing_size_answered", "listing_size_unknown", "listing_attributes_answered", "size_chart_request"}):
+            await self._send_size_chart_after_reply(chat_id, sender_id, item_id, source_id, content,
+                                                    verify_automatic_reply_before_attempt)
 
     async def send_heartbeat(self, ws):
         """发送心跳包并等待响应"""

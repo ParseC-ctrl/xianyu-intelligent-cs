@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-intelligent-cs";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20261026-02";
+  const ASSET_VERSION = "20261103-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -1436,6 +1436,7 @@
     renderAiConfig();
     if (state.customerServiceOnly) { renderShopStatus(); renderChat({ preserveScroll: true }); }
     loadMaterialStatus(context).catch(() => {});
+    if (state.customerServiceOnly) void loadSizeChart(context).catch(() => {});
     if (state.customerServiceOnly) void loadMaterialFaqs(context).catch((error) => formMessage("#materialFaqMessage", error.message || "问答读取失败。"));
     if (state.customerServiceOnly && isPlatformAdmin() && state.view === "ai-config") void loadCustomerReplySettings(context);
     if (state.ai.selectedItemId && accountContextMatches(context) && state.view === "ai-config") {
@@ -1453,6 +1454,43 @@
       : "尚未导入材质表。可以先导入并离线试答，不需要连接闲鱼账号。"
     );
     if (!state.customerServiceOnly && !data.knowledge_only) formMessage("#materialKnowledgeMessage", "当前为上游通用回复模式。启用知识库专用部署配置后，实际客服才会限定在材质问答范围。");
+  }
+
+  async function loadSizeChart(context = captureAccountContext()) {
+    const result = await accountScopedApi(context, "/api/bot/materials/size-chart");
+    if (!accountContextMatches(context)) return;
+    const last = result.last_status === "sent" ? "最近一次发送成功。" :
+      result.last_status === "failed" || result.last_status === "attempted" ? "最近一次发送未确认，请检查账号连接。" : "";
+    text("#sizeChartStatus", result.configured ? "已启用尺码对照图。" + last : "尚未配置尺码对照图，不会发送图片。");
+  }
+
+  async function saveSizeChart(event) {
+    event.preventDefault();
+    const file = $("#sizeChartFile")?.files?.[0];
+    if (!file || file.size > 4 * 1024 * 1024 || file.type !== "image/png") {
+      formMessage("#sizeChartMessage", "请选择不超过 4 MB 的 PNG 图片。"); return;
+    }
+    const context = captureAccountContext();
+    setBusy($("#sizeChartSave"), true);
+    try {
+      await accountScopedApi(context, "/api/bot/materials/size-chart", {method: "PUT", headers: {"Content-Type": "image/png"}, body: file});
+      if (!accountContextMatches(context)) return;
+      formMessage("#sizeChartMessage", "尺码图已保存并启用。", true);
+      await loadSizeChart(context);
+    } catch (error) { if (accountContextMatches(context)) formMessage("#sizeChartMessage", error.message || "保存失败。"); }
+    finally { setBusy($("#sizeChartSave"), false); }
+  }
+
+  async function removeSizeChart() {
+    const context = captureAccountContext();
+    setBusy($("#sizeChartRemove"), true);
+    try {
+      await accountScopedApi(context, "/api/bot/materials/size-chart", {method: "DELETE"});
+      if (!accountContextMatches(context)) return;
+      formMessage("#sizeChartMessage", "已停用并移除尺码图。", true);
+      await loadSizeChart(context);
+    } catch (error) { if (accountContextMatches(context)) formMessage("#sizeChartMessage", error.message || "操作失败。"); }
+    finally { setBusy($("#sizeChartRemove"), false); }
   }
 
   async function loadMaterialBinding(itemId, context = captureAccountContext()) {
@@ -4294,6 +4332,7 @@
     "/api/settings/ai/connection/test": ["POST"], "/api/bot/materials/status": ["GET"],
     "/api/bot/materials/search": ["GET"], "/api/bot/materials/import": ["POST"],
     "/api/bot/materials/preview": ["POST"], "/api/bot/materials/faqs": ["GET", "PUT"],
+    "/api/bot/materials/size-chart": ["GET", "PUT", "DELETE"],
   };
 
   function customerApiAllowed(path, method) {
@@ -11238,6 +11277,9 @@
     $("#aiDisableKnowledge").addEventListener("click", confirmDisableAiKnowledge);
     $("#aiRunPreview").addEventListener("click", runAiPreview);
     $("#materialImportForm").addEventListener("submit", importMaterialWorkbook);
+    $("#sizeChartForm")?.addEventListener("submit", saveSizeChart);
+    $("#sizeChartRemove")?.addEventListener("click", () => void removeSizeChart());
+    $("#sizeChartFile")?.addEventListener("change", () => text("#sizeChartFileName", $("#sizeChartFile")?.files?.[0]?.name || "未选择文件"));
     $("#materialFileInput")?.addEventListener("change", renderMaterialFileName);
     $("#materialSearchForm").addEventListener("submit", searchMaterialWorkbook);
     $("#materialBindingForm").addEventListener("submit", bindMaterialProduct);

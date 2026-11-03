@@ -316,6 +316,31 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent.send_text_reliably.await_count, 1)
         self.assertEqual(agent.context_manager.get_source_message("assistant:batch-a")["role"], "assistant_no_reply")
 
+    async def test_size_chart_runs_only_after_confirmed_text_reply(self):
+        agent, _ = self.build_agent(mode="rules_ai")
+        agent.knowledge_only = True
+        agent._customer_conversation_scope = AsyncMock(return_value="owned")
+        agent._wait_for_buyer_pause = AsyncMock(return_value=(True, False))
+        agent._pending_buyer_fragments = Mock(return_value=False)
+        agent._local_knowledge_item_context = Mock(return_value={"item_id": API_ITEM})
+        agent._ensure_ai_reply_ready = AsyncMock()
+        agent._generate_llm_reply = AsyncMock(return_value=GeneratedReply("可以参考尺码", "reply", "faq_answered", 1, "a" * 64))
+        agent.human_reply_delay = AsyncMock(return_value=0)
+        order = []
+        async def send_text(*args, **kwargs): order.append("text")
+        async def send_chart(*args):
+            self.assertEqual(agent.context_manager.get_source_message("assistant:chart-test")["role"], "assistant")
+            order.append("image")
+        agent.send_text_reliably = AsyncMock(side_effect=send_text)
+        agent._send_size_chart_after_reply = AsyncMock(side_effect=send_chart)
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "脚宽多少", "chart-test")
+        self.assertEqual(order, ["text", "image"])
+        agent.send_text_reliably = AsyncMock(side_effect=ConnectionError("offline"))
+        agent._send_size_chart_after_reply.reset_mock()
+        with self.assertRaises(ConnectionError):
+            await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "脚长多少", "chart-failed-text")
+        agent._send_size_chart_after_reply.assert_not_awaited()
+
     async def test_customer_new_fragment_during_generation_suppresses_old_answer(self):
         agent, bot = self.build_agent(mode="rules_ai")
         agent.knowledge_only = True

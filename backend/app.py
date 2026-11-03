@@ -283,6 +283,8 @@ def _rewrite_public_api_scope(scope: dict) -> bool:
 def _request_body_limit(path: str) -> int:
     if path == "/api/bot/materials/import":
         return 10 * 1024 * 1024
+    if path == "/api/bot/materials/size-chart":
+        return 4 * 1024 * 1024
     if path in {"/api/auth/login", "/api/auth/register", "/api/auth/bootstrap"}:
         return AUTH_REQUEST_BODY_LIMIT
     if path == "/api/admin/confirm" or path.startswith("/api/admin/updates/"):
@@ -322,6 +324,7 @@ def _customer_api_allowed(path: str, method: str) -> bool:
         "/api/bot/materials/import": {"POST"}, "/api/bot/materials/preview": {"POST"},
         "/api/bot/materials/faqs": {"GET", "PUT"},
         "/api/bot/materials/faqs/merge": {"POST"},
+        "/api/bot/materials/size-chart": {"GET", "PUT", "DELETE"},
         "/api/bot/reply-settings": {"GET", "PUT"},
         "/api/bot/catalog": {"GET"}, "/api/bot/catalog/sync": {"POST"},
         "/api/bot/catalog/settings": {"GET", "PUT"},
@@ -5249,6 +5252,49 @@ def clear_material_binding(item_id: str, user=Depends(Auth.current_user), accoun
         _raise_ai_error(error)
     except MaterialKnowledgeError as error:
         _material_error(error)
+
+
+@app.get("/api/bot/materials/size-chart")
+def get_size_chart(user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+    _require_permission(user, "automation.ai")
+    root = records._account_root(user["id"], str(account["account_key"]), create=True)
+    path = Path(root) / "size_chart.png"
+    status = None
+    db = Path(root) / "chat_history.db"
+    if db.is_file() and not db.is_symlink():
+        try:
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2) as conn:
+                row = conn.execute("SELECT status FROM size_chart_attempts ORDER BY created_at DESC LIMIT 1").fetchone()
+                status = row[0] if row and row[0] in {"sent", "failed", "cancelled", "attempted"} else None
+        except sqlite3.Error:
+            pass
+    return {"configured": path.is_file() and not path.is_symlink(), "last_status": status}
+
+
+@app.put("/api/bot/materials/size-chart")
+async def save_size_chart(request: Request, user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+    _require_permission(user, "automation.ai")
+    payload = await request.body()
+    if not payload or len(payload) > 4 * 1024 * 1024 or not payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise HTTPException(400, "请选择不超过 4 MB 的 PNG 图片")
+    root = Path(records._account_root(user["id"], str(account["account_key"]), create=True))
+    temporary = root / ("size_chart_upload_" + uuid.uuid4().hex)
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+        os.replace(temporary, root / "size_chart.png")
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {"configured": True}
+
+
+@app.delete("/api/bot/materials/size-chart")
+def delete_size_chart(user=Depends(Auth.current_user), account=Depends(current_shop_account)):
+    _require_permission(user, "automation.ai")
+    root = Path(records._account_root(user["id"], str(account["account_key"]), create=True))
+    (root / "size_chart.png").unlink(missing_ok=True)
+    return {"configured": False}
 
 
 @app.get("/api/bot/materials/faqs")

@@ -55,6 +55,7 @@ listing_size是询问当前链接的实际尺码，如“有什么码”“这�
 买家开场只发“50”“80”“50\n1要了”通常是出价，选择已审核的不议价FAQ；若紧接客服询问尺码或前文明确讨论尺码，数字可能是尺码，应结合上下文，不要按价格处理。具体订单金额、物流单号等不当报价。
 “这鞋不卖吗”“这双还能买吗”是当前商品能否购买，选择适用的已审核FAQ。不要声称查询过实时库存。
 “运动鞋穿42.5”“平时运动鞋穿42.5码”是买家提供选码信息，有选码FAQ应选择它；这不是商品尺码，也不需要转接。
+买家提供脚长、脚宽或询问如何选择尺码时，优先选择已审核的选码FAQ；不要根据尺码表自动计算或保证合脚。询问鞋内长时应选择内长说明FAQ，不虚构测量值。
 售前询问“不合脚能退吗或者换码”“买完以后不合适能退吗”等，若有覆盖退换说明和尺码参考的审核FAQ，选择该FAQ；仅询问一般退换政策时选择相应政策FAQ。已经收货、实际申请退换、商品质量争议或订单状态需要核实，不能仅用通用售前政策解决。
 “是不是正品”询问渠道或真伪，选择适用的审核FAQ；“有原装鞋垫吗”询问鞋垫是否随鞋附带，选择适用的审核FAQ，不是询问鞋垫材质。单独问“鞋垫是什么材质”仍选material和insole。
 “这个内长多少”“鞋内长几厘米”询问长度而非鞋垫材质，选择适用的内长说明FAQ；没有实测长度时不能猜测或由鞋码换算厘米，程序可根据商品资料补充实际码数。
@@ -392,6 +393,11 @@ def _verified_answer(store, *, message: str, facts: dict | None,
     if UNSAFE_QUESTION.search(message) and category not in {"human", "business_human"}:
         category = "other"
     metadata["intent"] = category
+    if re.fullmatch(r"(?:请|麻烦|能否|可以|再|帮我|给我|能|你好|在吗|[,，\s])*?(?:发|给|看|提供|来|再发).{0,8}(?:尺码表|码数表|对照表)(?:吗|嘛|呀|哈)?[?？!！。\s]*", message):
+        chart = store.account_dir / "size_chart.png"
+        if chart.is_file() and not chart.is_symlink():
+            return _reply(store, version, "好的，尺码对照表可以参考一下哈。", "size_chart_request", fixed_reply=True, **metadata)
+        return _reply(store, version, "尺码表暂时没有准备好，可以先参考商品的尺码说明哈。", "size_chart_unavailable", fixed_reply=True, **metadata)
     if category == "human":
         return _handoff("buyer_requests_human", **metadata)
     if category == "business_human":
