@@ -12,14 +12,24 @@ MAX_BYTES = 4 * 1024 * 1024
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
-def wants_chart(message):
-    text = unicodedata.normalize("NFKC", str(message or ""))
-    return bool(re.search(r"脚长|脚宽|足长|足宽|尺码|鞋码|码数|几码|多少码|多大码|选码|内长|合脚|偏码|偏大|偏小|尺码表|码数表|对照表|(?:3[0-9]|4[0-9]|50)(?:\.5)?\s*码|(?:运动鞋|皮鞋)(?:平时)?穿\s*(?:3[0-9]|4[0-9]|50)(?:\.5)?", text))
+def _chart_resend_followup(message, history):
+    text = unicodedata.normalize("NFKC", str(message or "")).strip()
+    if not re.fullmatch(r"(?:你|您|请|麻烦|麻烦你|可以|能不能|帮我|给我|那)*(?:再|重新)(?:给我|帮我|给|帮)?(?:发|发送)(?:一下|一次|一遍|一张|下)?(?:给我)?(?:可以吗|好吗|吗|哈|吧|呀|呢|嘛)?[?？!！。，,\s]*", text):
+        return False
+    last = next((entry for entry in reversed(history or []) if isinstance(entry, dict)
+                 and entry.get("role") in {"user", "assistant"}), None)
+    return bool(last and last.get("role") == "assistant" and re.search(
+        r"尺码(?:表|图|对照表|对照图)|码数表|对照表", str(last.get("content") or last.get("text") or "")))
 
 
-def explicitly_requests_chart(message):
+def wants_chart(message, history=None):
     text = unicodedata.normalize("NFKC", str(message or ""))
-    return bool(re.search(r"(?:发|给|看|提供|来|再发).{0,12}(?:尺码表|码数表|对照表)|(?:尺码表|码数表|对照表).{0,12}(?:发|给|看|有吗|在哪)", text))
+    return bool(re.search(r"脚长|脚宽|足长|足宽|尺码|鞋码|码数|几码|多少码|多大码|选码|内长|合脚|偏码|偏大|偏小|尺码表|尺码图|码数表|对照表|(?:3[0-9]|4[0-9]|50)(?:\.5)?\s*码|(?:运动鞋|皮鞋)(?:平时)?穿\s*(?:3[0-9]|4[0-9]|50)(?:\.5)?", text) or _chart_resend_followup(text, history))
+
+
+def explicitly_requests_chart(message, history=None):
+    text = unicodedata.normalize("NFKC", str(message or ""))
+    return bool(re.search(r"(?:发|给|看|提供|来|再发).{0,12}(?:尺码表|尺码图|尺码对照图|码数表|对照表)|(?:尺码表|尺码图|尺码对照图|码数表|对照表).{0,12}(?:发|给|看|有吗|在哪)", text) or _chart_resend_followup(text, history))
 
 
 def read_chart(state_dir):

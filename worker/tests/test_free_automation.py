@@ -328,7 +328,7 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
         agent.human_reply_delay = AsyncMock(return_value=0)
         order = []
         async def send_text(*args, **kwargs): order.append("text")
-        async def send_chart(*args):
+        async def send_chart(*args, **kwargs):
             self.assertEqual(agent.context_manager.get_source_message("assistant:chart-test")["role"], "assistant")
             order.append("image")
         agent.send_text_reliably = AsyncMock(side_effect=send_text)
@@ -361,6 +361,11 @@ class FreeAutomationTests(unittest.IsolatedAsyncioTestCase):
         size_chart.finish(agent.chat_db_file, CHAT_ID, "record", "sent")
         await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "脚长多少啊", "chart-sent")
         self.assertIn("前面发过", agent.send_text_reliably.await_args.args[2])
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "你再发一次", "chart-followup")
+        self.assertIn("给你发一张", agent.send_text_reliably.await_args.args[2])
+        self.assertTrue(agent._send_size_chart_after_reply.await_args.kwargs["history"])
+        await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "重新发一次尺码图", "chart-picture")
+        self.assertIn("给你发一张", agent.send_text_reliably.await_args.args[2])
         await agent._process_buyer_chat(CHAT_ID, BUYER_ID, API_ITEM, "再发一下那个尺码表", "chart-again")
         self.assertIn("给你发一张", agent.send_text_reliably.await_args.args[2])
 

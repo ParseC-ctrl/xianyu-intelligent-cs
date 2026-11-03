@@ -97,14 +97,25 @@ def _positive_human_request(text: str) -> bool:
     return bool(HUMAN_REQUEST.search(HUMAN_NEGATION.sub("", text)))
 
 
-def _is_chart_consultation(message: str) -> bool:
+def _chart_resend_followup(message: str, history: list | None) -> bool:
+    text = unicodedata.normalize("NFKC", str(message or "")).strip()
+    if not re.fullmatch(r"(?:你|您|请|麻烦|麻烦你|可以|能不能|帮我|给我|那)*(?:再|重新)(?:给我|帮我|给|帮)?(?:发|发送)(?:一下|一次|一遍|一张|下)?(?:给我)?(?:可以吗|好吗|吗|哈|吧|呀|呢|嘛)?[?？!！。，,\s]*", text):
+        return False
+    last = next((entry for entry in reversed(history or []) if isinstance(entry, dict)
+                 and entry.get("role") in {"user", "assistant"}), None)
+    return bool(last and last.get("role") == "assistant" and re.search(
+        r"尺码(?:表|图|对照表|对照图)|码数表|对照表", str(last.get("content") or last.get("text") or "")))
+
+
+def _is_chart_consultation(message: str, history: list | None = None) -> bool:
     """Short chart or foot-measurement questions need no invented measurement."""
     text = unicodedata.normalize("NFKC", str(message or "")).strip()
     if not text or len(text) > 120 or _positive_human_request(text) or UNSAFE_QUESTION.search(text):
         return False
     if re.search(r"退|换货|换码|退款|质量|瑕疵|订单|物流|快递|发货|价格|多少钱|优惠|材质|正品", text):
         return False
-    return bool(re.search(r"尺码表|码数表|尺码对照表|尺码对照图|对照表|脚长|脚宽|足长|足宽", text))
+    return bool(re.search(r"尺码表|尺码图|码数表|尺码对照表|尺码对照图|对照表|脚长|脚宽|足长|足宽", text)
+                or _chart_resend_followup(text, history))
 
 
 def _last_assistant_is(history, reply: str) -> bool:
@@ -343,7 +354,7 @@ def _verified_answer(store, *, message: str, facts: dict | None,
     except Exception:
         return _handoff("knowledge_unavailable")
     method = "model" if model_call else "offline_rules"
-    if _is_chart_consultation(message):
+    if _is_chart_consultation(message, history):
         chart = store.account_dir / "size_chart.png"
         metadata = {"intent_method": "local_chart", "intent": "size_chart"}
         if chart.is_file() and not chart.is_symlink():

@@ -41,6 +41,11 @@ class SizeChartTests(unittest.TestCase):
         self.assertFalse(size_chart.explicitly_requests_chart("这个尺码多少"))
         self.assertTrue(size_chart.explicitly_requests_chart("再发一下那个尺码表"))
         self.assertFalse(size_chart.explicitly_requests_chart("有没有对应的尺码表"))
+        history = [{"role": "assistant", "content": "尺码对照表前面发过啦，可以对照脚长和脚宽看看哈～"}]
+        self.assertTrue(size_chart.explicitly_requests_chart("你再发一次", history))
+        self.assertTrue(size_chart.explicitly_requests_chart("重新发一次尺码图"))
+        self.assertTrue(size_chart.wants_chart("你再发一次", history))
+        self.assertFalse(size_chart.explicitly_requests_chart("你再发一次", [{"role": "assistant", "content": "鞋子的图片在上面哦"}]))
 
     def test_delivery_status_distinguishes_confirmed_and_uncertain(self):
         digest = size_chart.read_chart(self.root)[1]
@@ -65,8 +70,11 @@ class SizeChartTests(unittest.TestCase):
             agent.send_msg = send
             for source, message in [("one", "尺码多少"), ("two", "脚宽多少"), ("three", "再发下尺码表"), ("three", "再发下尺码表")]:
                 await agent._send_size_chart_after_reply("chat", "buyer", "item", source, message, verify)
-            self.assertEqual(len(sends), 2)
-            self.assertEqual(len(set(sends)), 2)
+            history = [{"role": "assistant", "content": "尺码对照表前面发过啦"}]
+            await agent._send_size_chart_after_reply("chat", "buyer", "item", "four", "你再发一次", verify, history=history)
+            await agent._send_size_chart_after_reply("chat", "buyer", "item", "five", "重新发一次尺码图", verify)
+            self.assertEqual(len(sends), 4)
+            self.assertEqual(len(set(sends)), 4)
             self.assertEqual(len(list(self.root.glob("manual_reply_*.png"))), 0)
             async def fail(*args, **kwargs):
                 sends.append("failure")

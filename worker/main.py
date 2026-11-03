@@ -2583,9 +2583,9 @@ class XianyuLive:
             },
         }
 
-    async def _send_size_chart_after_reply(self, chat_id, sender_id, item_id, source_id, message, verify):
+    async def _send_size_chart_after_reply(self, chat_id, sender_id, item_id, source_id, message, verify, history=None):
         """Send one private chart after text, with no automatic retry on uncertainty."""
-        if not size_chart.wants_chart(message):
+        if not size_chart.wants_chart(message, history):
             return
         chart = size_chart.read_chart(self.state_dir)
         if chart is None:
@@ -2605,7 +2605,7 @@ class XianyuLive:
                 if not current or current[1] != digest:
                     return None
                 reserved = size_chart.reserve(self.chat_db_file, chat_id, source_id, digest,
-                                             explicit=size_chart.explicitly_requests_chart(message))
+                                             explicit=size_chart.explicitly_requests_chart(message, history))
                 if not reserved:
                     return None
                 if not self.ws or not self.connection_ready.is_set():
@@ -5081,7 +5081,7 @@ class XianyuLive:
             chart = size_chart.read_chart(self.state_dir)
             if chart:
                 state = size_chart.delivery_state(self.chat_db_file, chat_id, chart[1])
-                if size_chart.explicitly_requests_chart(content):
+                if size_chart.explicitly_requests_chart(content, prior_context):
                     bot_reply = "好呀，我给你发一张尺码对照表参考哈～"
                 elif state == "sent":
                     bot_reply = "尺码对照表前面发过啦，可以对照脚长和脚宽看看哈～"
@@ -5195,7 +5195,7 @@ class XianyuLive:
         if (getattr(self, "knowledge_only", False) and reply_from_ai and not replaying_draft
                 and reason_code in {"faq_answered", "listing_size_answered", "listing_size_unknown", "listing_attributes_answered", "size_chart_request"}):
             await self._send_size_chart_after_reply(chat_id, sender_id, item_id, source_id, content,
-                                                    verify_automatic_reply_before_attempt)
+                                                    verify_automatic_reply_before_attempt, history=prior_context)
 
     async def send_heartbeat(self, ws):
         """发送心跳包并等待响应"""

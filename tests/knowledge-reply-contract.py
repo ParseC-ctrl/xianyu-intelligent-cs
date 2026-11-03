@@ -47,6 +47,12 @@ def main():
         for question in ["有没有对应的尺码表", "再发一下那个尺码表", "脚长多少啊", "脚宽\n该码的脚宽多少"]:
             result = ask(question, model_call=lambda _: (_ for _ in ()).throw(RuntimeError("unavailable")))
             assert result["reason_code"] == "size_chart_request", (question, result)
+        chart_history = [{"role": "assistant", "content": "尺码对照表前面发过啦，可以对照脚长和脚宽看看哈～"}]
+        for question in ["你再发一次", "重新发一次尺码图", "再给我发一遍"]:
+            result = ask(question, history=chart_history, model_call=lambda _: (_ for _ in ()).throw(RuntimeError("unavailable")))
+            assert result["reason_code"] == "size_chart_request", (question, result)
+        unrelated = [{"role": "assistant", "content": "鞋面是合成材质。"}]
+        assert ask("你再发一次", history=unrelated, model_call=model("business_human"))["decision"] == "handoff"
         assert ask("请转人工", model_call=model("human"))["reason_code"] == "buyer_requests_human"
         assert ask("脚宽不合适想退货", model_call=model("business_human"))["decision"] == "handoff"
         material_model = model(fields=["upper", "lining"])
