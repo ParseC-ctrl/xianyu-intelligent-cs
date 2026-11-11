@@ -111,6 +111,28 @@ def main():
 
         size_faq = {"id": "size", "question": "尺码怎么选", "answer": "标准皮鞋码，比如运动鞋42选41。", "enabled": True}
         store.save_faqs([size_faq])
+        for category in ("business_human", "unclear", "listing_size"):
+            for question in ("这个41码是运动鞋42码吗", "这款40码相当于运动鞋41码吗"):
+                result = ask(question, model_call=model(category))
+                assert result["reason_code"] == "faq_answered" and result["faq_id"] == "size", (question, result)
+        assert ask("这个41码是运动鞋42码吗，我已下单想退款", model_call=model("business_human"))["decision"] == "handoff"
+        assert ask("这个41码是运动鞋42码吗，转人工", model_call=model("human"))["decision"] == "handoff"
+        store.save_faqs([])
+        assert ask("这个41码是运动鞋42码吗", model_call=model("business_human"))["decision"] == "handoff"
+        store.save_faqs([size_faq])
+        presale = {"id": "presale", "question": "售前真伪与售后咨询", "answer": "来源及售后以审核资料为准。", "topics": ["不是真牛皮或假货能退货吗"], "enabled": True, "fixed_reply": True}
+        proof = {"id": "proof", "question": "询问商品来源凭证", "answer": "来源有审核资料，凭证尚未核实。", "topics": ["有购买记录吗"], "enabled": True, "fixed_reply": True}
+        store.save_faqs([size_faq, presale, proof])
+        for question, faq_id in [("不是真牛皮，或假货能退货吗", "presale"), ("🈶购买记录吗", "proof")]:
+            for category in ("business_human", "material", "purchase"):
+                response = ask(question, model_call=model(category, fields=["upper"] if category == "material" else []))
+                assert response["reason_code"] == "faq_answered" and response["faq_id"] == faq_id, (question, response)
+        assert ask("收到的鞋是假货，我要退货", model_call=model("business_human"))["decision"] == "handoff"
+        assert ask("查一下我的购买记录", model_call=model("business_human"))["decision"] == "handoff"
+        presale["enabled"] = False
+        store.save_faqs([size_faq, presale, proof])
+        assert ask("不是真牛皮，或假货能退货吗", model_call=model("business_human"))["decision"] == "handoff"
+        store.save_faqs([size_faq])
         hist = [{"role": "user", "content": "我40码的脚好穿吗"}, {"role": "assistant", "content": "比如运动鞋42选41。"}]
         hist += [{"role": "user", "content": "看看这双"}, {"role": "assistant", "content": "在的"}] * 5
         captured = []

@@ -56,8 +56,10 @@ listing_size是询问当前链接的实际尺码，如“有什么码”“这�
 “这鞋不卖吗”“这双还能买吗”是当前商品能否购买，选择适用的已审核FAQ。不要声称查询过实时库存。
 “运动鞋穿42.5”“平时运动鞋穿42.5码”是买家提供选码信息，有选码FAQ应选择它；这不是商品尺码，也不需要转接。
 买家提供脚长、脚宽或询问如何选择尺码时，优先选择已审核的选码FAQ；不要根据尺码表自动计算或保证合脚。询问鞋内长时应选择内长说明FAQ，不虚构测量值。
+“这个41码是运动鞋42码吗”等是在询问皮鞋码与运动鞋码的参考关系，有适用的选码FAQ时选择它，不要把买家提到的商品码数当成已核实资料，不保证合脚。
 售前询问“不合脚能退吗或者换码”“买完以后不合适能退吗”等，若有覆盖退换说明和尺码参考的审核FAQ，选择该FAQ；仅询问一般退换政策时选择相应政策FAQ。已经收货、实际申请退换、商品质量争议或订单状态需要核实，不能仅用通用售前政策解决。
 “是不是正品”询问渠道或真伪，选择适用的审核FAQ；“有原装鞋垫吗”询问鞋垫是否随鞋附带，选择适用的审核FAQ，不是询问鞋垫材质。单独问“鞋垫是什么材质”仍选material和insole。
+售前假设“不是所说材质或是假货能退吗”时，只有覆盖真伪和此类售后咨询的审核FAQ才能完整回答；不要推断具体材质或承诺未审核的退货结果。询问商品来源的购买记录或凭证时，选择覆盖此问题的审核FAQ，不声称凭证存在；询问买家自己的订单记录或已经发生的售后争议仍需核实。
 “这个内长多少”“鞋内长几厘米”询问长度而非鞋垫材质，选择适用的内长说明FAQ；没有实测长度时不能猜测或由鞋码换算厘米，程序可根据商品资料补充实际码数。
 发货时效FAQ仅说明通常安排，不能据此宣称某个订单已发货、保证某日到达；成色FAQ仅说明通用情况，不能确认某件商品的具体瑕疵位置或承诺没有瑕疵。需要实际订单、库存、单件状态而没有资料时business_human。
 价格、库存、发货、订单异常、议价、退款售后、性能、尺码等业务问题，没有完全适用的已审核FAQ时为business_human。多项业务混合且资料不能完整覆盖时也为business_human。
@@ -387,7 +389,7 @@ def _verified_answer(store, *, message: str, facts: dict | None,
         order_dispute = re.search(r"(?<!非)质量问题|开胶|破损|瑕疵(?:严重|问题)|已经(?:买|付款|下单|收货)|已(?:付款|下单|收货)|收到(?:货|鞋|了)|申请(?:退|换|退款)|我要(?:退货|退款|换货)|退款进度|订单.{0,8}(?:退|换|退款)", compact)
         if order_dispute:
             category = "business_human"
-        elif re.search(r"正品|鞋垫|内长|退|换码|换货|换鞋|售后", compact):
+        elif re.search(r"正品|真假|假货|购买记录|鞋垫|内长|退|换码|换货|换鞋|售后", compact):
             faq = _exact_reviewed_topic(enabled_faqs, compact)
             if faq:
                 category, intent = "faq", {**intent, "faq_id": faq["id"]}
@@ -400,6 +402,10 @@ def _verified_answer(store, *, message: str, facts: dict | None,
             category = "listing_attributes"
         elif re.fullmatch(r"(?:哪里发货|从哪里发货|从哪发货|发货地在哪|哪里寄出|发货地是哪里|这鞋不卖吗|这双不卖吗|这款不卖吗|这双还能买吗|这鞋还卖吗)[?？!！。\s]*", compact):
             faq = _exact_reviewed_topic(enabled_faqs, compact)
+            if faq:
+                category, intent = "faq", {**intent, "faq_id": faq["id"]}
+        elif re.fullmatch(r"(?:这个|这款|这双|这鞋|这)?\s*(?:3[0-9]|4[0-9]|50)(?:\.5)?\s*码\s*(?:是|相当于|等于|对应)\s*运动鞋\s*(?:3[0-9]|4[0-9]|50)(?:\.5)?\s*码(?:吗|么|嘛|呢)?[。！!？?\s]*", compact):
+            faq = _unambiguous_faq(enabled_faqs, _is_size_fit_faq)
             if faq:
                 category, intent = "faq", {**intent, "faq_id": faq["id"]}
         elif category in {"business_human", "unclear"}:
